@@ -1,0 +1,32 @@
+{
+  "productName": "Shelly",
+  "version": "0.1.0",
+  "identifier": "com.shelly.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Shelly",
+        "width": 980,
+        "height": 610,
+        "minWidth": 700,
+        "minHeight": 450,
+        "resizable": true,
+        "decorations": false,
+        "transparent": false,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  }
+}

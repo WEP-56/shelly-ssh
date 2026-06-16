@@ -1,0 +1,33 @@
+example
+node_modules
+.claude
+
+# Frontend build
+dist/
+.vite/
+
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Bundles
+*.app
+*.dmg
+*.deb
+*.rpm
+*.msi
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.local
+
+# Temp
+gen_index.py

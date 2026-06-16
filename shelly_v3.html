@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Shelly v3</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --fm:"JetBrains Mono","Fira Code","Cascadia Code",monospace;
+  --fs:-apple-system,"Inter","Segoe UI",sans-serif;
+  --c0:#080a0d;
+  --c1:#0e1014;
+  --c2:#13151a;
+  --c3:#1a1d23;
+  --c4:#22252d;
+  --c5:#2e3240;
+  --b0:rgba(255,255,255,0.04);
+  --b1:rgba(255,255,255,0.08);
+  --b2:rgba(255,255,255,0.14);
+  --b3:rgba(255,255,255,0.22);
+  --t0:#f0f2f5;
+  --t1:#8a8f9e;
+  --t2:#4a4f60;
+  --t3:#2e3240;
+  --acc:#d4a843;
+  --acc2:rgba(212,168,67,0.12);
+  --red:#c0392b;
+  --grn:#27ae60;
+  --r:2px;
+}
+html,body{
+  width:100%;height:100%;
+  background:#050608;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--fm);
+}
+.app{
+  display:flex;width:980px;height:610px;
+  background:var(--c1);
+  border:1px solid var(--b2);
+  border-radius:8px;
+  overflow:hidden;
+  font-size:12px;
+  box-shadow:0 0 0 1px rgba(0,0,0,0.8),0 40px 80px rgba(0,0,0,0.9);
+}
+.titlebar{
+  position:absolute;top:0;left:0;right:0;height:36px;
+  background:var(--c0);
+  border-bottom:1px solid var(--b1);
+  display:flex;align-items:center;
+  padding:0 14px;gap:8px;z-index:100;
+  border-radius:8px 8px 0 0;
+}
+.wm-dots{display:flex;gap:6px;margin-right:6px}
+.wm-dot{width:11px;height:11px;border-radius:50%}
+.wm-close{background:#3a1a1a;border:1px solid #5a2020}
+.wm-min{background:#2a2510;border:1px solid #4a4010}
+.wm-max{background:#0f2a14;border:1px solid #1a4a20}
+.tb-title{font-family:var(--fm);font-size:11px;color:var(--t2);letter-spacing:0.03em;flex:1;text-align:center}
+.tb-pill{font-size:10px;color:var(--t2);background:var(--b0);border:1px solid var(--b1);border-radius:var(--r);padding:2px 7px;font-family:var(--fm)}
+.body{display:flex;width:100%;height:100%;padding-top:36px}
+
+/* LEFT SIDEBAR */
+.lsb{width:192px;flex-shrink:0;background:var(--c0);border-right:1px solid var(--b1);display:flex;flex-direction:column;overflow:hidden;transition:width 0.15s}
+.lsb.hide{width:0;border-right:none}
+.lsb-head{padding:11px 12px 10px;border-bottom:1px solid var(--b0);display:flex;align-items:center;justify-content:space-between}
+.lsb-wordmark{font-family:var(--fm);font-size:11px;font-weight:500;color:var(--t0);letter-spacing:0.06em;display:flex;align-items:center;gap:6px}
+.lsb-wordmark i{font-size:13px;color:var(--acc)}
+.lsb-btn{width:20px;height:20px;display:flex;align-items:center;justify-content:center;color:var(--t2);cursor:pointer;border-radius:var(--r)}
+.lsb-btn:hover{background:var(--b1);color:var(--t1)}
+.lsb-btn i{font-size:12px}
+.lsb-search{margin:8px 10px;display:flex;align-items:center;gap:5px;background:var(--c2);border:1px solid var(--b1);border-radius:var(--r);padding:4px 8px}
+.lsb-search i{font-size:11px;color:var(--t3)}
+.lsb-search span{font-size:11px;color:var(--t3)}
+.sec{font-family:var(--fm);font-size:10px;color:var(--t3);letter-spacing:0.1em;text-transform:uppercase;padding:8px 12px 4px}
+.clist{padding:0 6px;overflow-y:auto}
+.ci{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:var(--r);cursor:pointer;white-space:nowrap}
+.ci:hover{background:var(--b0)}
+.ci.on{background:var(--c3);border:1px solid var(--b1)}
+.cdot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.cg{background:#27ae60}.ca{background:#e67e22}.cx{background:var(--t3)}
+.cinfo{flex:1;min-width:0}
+.cname{font-size:11px;color:var(--t0);overflow:hidden;text-overflow:ellipsis}
+.chost{font-size:10px;color:var(--t2);overflow:hidden;text-overflow:ellipsis;font-family:var(--fm)}
+.cms{font-size:10px;color:var(--t3);flex-shrink:0;font-family:var(--fm)}
+.lsb-foot{padding:8px 6px;border-top:1px solid var(--b0);display:flex;gap:2px}
+.ibt{flex:1;display:flex;align-items:center;justify-content:center;padding:5px;border-radius:var(--r);cursor:pointer;color:var(--t2);background:none;border:none}
+.ibt:hover{background:var(--b1);color:var(--t1)}
+.ibt i{font-size:13px}
+
+/* DRAG HANDLE */
+.dh{width:1px;background:var(--b1);flex-shrink:0;cursor:col-resize;transition:background 0.1s,width 0.1s}
+.dh:hover,.dh.act{background:var(--acc);width:2px}
+
+/* MAIN */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--c1)}
+.tabbar{display:flex;align-items:center;background:var(--c0);border-bottom:1px solid var(--b1);height:30px;padding:0 8px;gap:0;flex-shrink:0}
+.tab{display:flex;align-items:center;gap:5px;height:30px;padding:0 11px;font-family:var(--fm);font-size:11px;color:var(--t2);cursor:pointer;border-right:1px solid var(--b0);white-space:nowrap;position:relative}
+.tab:hover{background:var(--b0);color:var(--t1)}
+.tab.on{color:var(--t0);background:var(--c1);border-right:1px solid var(--b1)}
+.tab.on::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:var(--acc)}
+.tab i{font-size:11px}
+.tab .cx2{font-size:10px;color:var(--t3);width:13px;height:13px;display:flex;align-items:center;justify-content:center;border-radius:1px}
+.tab .cx2:hover{background:var(--b2);color:var(--t1)}
+.tabsp{flex:1}
+.tabact{display:flex;gap:1px}
+.tba{display:flex;align-items:center;justify-content:center;width:26px;height:30px;cursor:pointer;color:var(--t2)}
+.tba:hover{background:var(--b1);color:var(--t1)}
+.tba i{font-size:12px}
+
+.panerow{flex:1;display:flex;min-height:0}
+
+/* TERMINAL */
+.term{flex:1;min-width:0;background:var(--c0);font-family:var(--fm);font-size:12px;line-height:1.6;padding:12px 14px;overflow-y:auto;position:relative}
+.tconn{font-size:10px;color:var(--t3);margin-bottom:10px;letter-spacing:0.02em}
+.tl{display:flex;gap:6px;margin-bottom:1px}
+.tp{color:#5b7fa6;flex-shrink:0}
+.tpc{color:var(--acc);flex-shrink:0}
+.tc{color:var(--t0)}
+.to{color:var(--t2);padding-left:2px}
+.tg{color:#27ae60;padding-left:2px}
+.tr{color:#c0392b;padding-left:2px}
+.tblk{margin-bottom:7px}
+.tcur{display:inline-block;width:7px;height:13px;background:var(--acc);vertical-align:-2px;animation:blink 1s step-end infinite}
+@keyframes blink{50%{opacity:0}}
+
+/* SLASH POPUP */
+.spop{position:absolute;bottom:20px;left:14px;width:370px;background:var(--c2);border:1px solid var(--b2);border-radius:var(--r);overflow:hidden;box-shadow:0 12px 32px rgba(0,0,0,0.7);z-index:50}
+.sphd{display:flex;align-items:center;justify-content:space-between;padding:5px 10px;border-bottom:1px solid var(--b1);background:var(--c3)}
+.sphd-l{font-size:10px;color:var(--acc);letter-spacing:0.06em;text-transform:uppercase}
+.sphd-r{font-size:10px;color:var(--t3)}
+.spi{display:flex;align-items:center;gap:9px;padding:6px 10px;cursor:pointer}
+.spi:hover,.spi.on{background:var(--c4)}
+.spi-ic{font-size:11px;color:var(--t2);flex-shrink:0;width:13px;text-align:center}
+.spi-b{flex:1;min-width:0}
+.spi-cmd{font-size:12px;color:var(--t0);font-weight:500}
+.spi-cmd em{color:var(--acc);font-style:normal}
+.spi-desc{font-size:10px;color:var(--t2);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.spi-tag{font-size:9px;padding:1px 5px;border-radius:1px;background:var(--c4);color:var(--t2);border:1px solid var(--b1);flex-shrink:0}
+
+/* RIGHT SIDEBAR */
+.rsb{width:210px;flex-shrink:0;background:var(--c0);border-left:1px solid var(--b1);display:flex;flex-direction:column;overflow:hidden;transition:width 0.15s}
+.rsb.hide{width:0;border-left:none}
+.rs-tabs{display:flex;border-bottom:1px solid var(--b1);height:30px;flex-shrink:0}
+.rst{flex:1;display:flex;align-items:center;justify-content:center;font-size:10.5px;color:var(--t2);cursor:pointer;border-right:1px solid var(--b0);letter-spacing:0.02em;position:relative}
+.rst:hover{color:var(--t1);background:var(--b0)}
+.rst.on{color:var(--t0);background:var(--c1)}
+.rst.on::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:var(--acc)}
+.rs-xcl{display:flex;align-items:center;justify-content:center;width:26px;cursor:pointer;color:var(--t3)}
+.rs-xcl:hover{color:var(--t1);background:var(--b1)}
+.rs-xcl i{font-size:11px}
+.rsb-body{flex:1;overflow-y:auto;padding:8px}
+
+/* FILE TREE */
+.ft{font-size:11px}
+.ftd{display:flex;align-items:center;gap:4px;padding:3px 4px;border-radius:var(--r);cursor:pointer;color:var(--t1)}
+.ftd:hover{background:var(--b0)}
+.ftd i{font-size:11px}
+.ftd .dn{color:var(--t0)}
+.ftch{padding-left:13px}
+.ftf{display:flex;align-items:center;gap:4px;padding:3px 4px;border-radius:var(--r);cursor:pointer;color:var(--t1)}
+.ftf:hover{background:var(--b1)}
+.ftf.sel{background:var(--c4);border:1px solid var(--b2)}
+.ftf i{font-size:11px}
+.ftf .fn{color:var(--t0)}
+.ftf .fsz{margin-left:auto;font-size:10px;color:var(--t3)}
+.bc{font-size:9px;padding:1px 5px;border-radius:1px;background:rgba(212,168,67,0.1);color:var(--acc);border:1px solid rgba(212,168,67,0.2);margin-left:auto}
+
+/* HISTORY */
+.hist-i{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:var(--r);cursor:pointer;margin-bottom:3px;background:var(--c2);border:1px solid var(--b0)}
+.hist-i:hover{border-color:var(--b2)}
+.hist-i i{font-size:10px;color:var(--t3);flex-shrink:0}
+.hist-cmd{font-size:11px;color:var(--t1);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-t{font-size:10px;color:var(--t3);flex-shrink:0}
+
+/* SNIPPETS */
+.note-b{background:var(--c2);border:1px solid var(--b0);border-radius:var(--r);padding:6px 8px;margin-bottom:5px;cursor:pointer}
+.note-b:hover{border-color:var(--b2)}
+.note-ttl{font-size:11px;color:var(--t0);margin-bottom:2px}
+.note-al{font-size:11px;color:var(--acc)}
+
+/* FILE PREVIEW */
+.fp{width:0;flex-shrink:0;background:var(--c1);border-left:1px solid var(--b1);display:flex;flex-direction:column;overflow:hidden;transition:width 0.15s}
+.fp.open{width:240px}
+.fp-hd{height:30px;border-bottom:1px solid var(--b1);display:flex;align-items:center;gap:6px;padding:0 10px;flex-shrink:0;background:var(--c0)}
+.fp-fn{font-size:11px;color:var(--t0);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fp-act{display:flex;gap:1px}
+.fp-ab{display:flex;align-items:center;justify-content:center;width:22px;height:22px;cursor:pointer;color:var(--t2);border-radius:var(--r)}
+.fp-ab:hover{background:var(--b1);color:var(--t1)}
+.fp-ab i{font-size:12px}
+.fp-body{flex:1;overflow:auto;padding:10px 12px;font-family:var(--fm);font-size:11px;line-height:1.7}
+.fl{display:block;white-space:pre}
+.fln{color:var(--t3);user-select:none;margin-right:10px;min-width:18px;display:inline-block;text-align:right}
+.kw{color:#c792ea}.str{color:#c3e88d}.cmt{color:var(--t3)}.fn2{color:#82aaff}.t0c{color:var(--t2)}.trc{color:#c0392b}
+
+/* STATUS BAR */
+.sbar{display:flex;align-items:center;gap:10px;padding:3px 12px;background:var(--c0);border-top:1px solid var(--b1);font-size:10px;color:var(--t3);flex-shrink:0;font-family:var(--fm)}
+.sdot{width:5px;height:5px;border-radius:50%;background:#27ae60;display:inline-block;margin-right:4px}
+.si2{display:flex;align-items:center;gap:3px}
+.si2 i{font-size:11px}
+.sacc{color:var(--acc)}
+.sskbd{font-size:10px;color:var(--t2);background:var(--c3);border:1px solid var(--b1);border-radius:2px;padding:0 5px;line-height:16px;display:inline-block}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="titlebar">
+    <div class="wm-dots">
+      <div class="wm-dot wm-close"></div>
+      <div class="wm-dot wm-min"></div>
+      <div class="wm-dot wm-max"></div>
+    </div>
+    <div class="tb-title">Shelly — prod-web-01</div>
+    <div class="tb-pill">SSH</div>
+  </div>
+
+  <div class="body">
+    <!-- LEFT SIDEBAR -->
+    <div class="lsb" id="lsb">
+      <div class="lsb-head">
+        <div class="lsb-wordmark">
+          <i class="ti ti-terminal-2" aria-hidden="true"></i>
+          SHELLY
+        </div>
+        <div class="lsb-btn" id="lsb-tog" title="折叠">
+          <i class="ti ti-layout-sidebar-left-collapse"></i>
+        </div>
+      </div>
+      <div class="lsb-search">
+        <i class="ti ti-search" aria-hidden="true"></i>
+        <span>filter connections</span>
+      </div>
+      <div class="sec">connected</div>
+      <div class="clist">
+        <div class="ci on">
+          <div class="cdot cg"></div>
+          <div class="cinfo">
+            <div class="cname">prod-web-01</div>
+            <div class="chost">root@192.168.1.10</div>
+          </div>
+          <span class="cms">12ms</span>
+        </div>
+        <div class="ci">
+          <div class="cdot ca"></div>
+          <div class="cinfo">
+            <div class="cname">staging-db</div>
+            <div class="chost">ubuntu@10.0.0.5</div>
+          </div>
+          <span class="cms">38ms</span>
+        </div>
+      </div>
+      <div class="sec">recent</div>
+      <div class="clist" style="flex:0">
+        <div class="ci">
+          <div class="cdot cx"></div>
+          <div class="cinfo"><div class="cname">dev-vm</div><div class="chost">wep@47.93.xx.xx</div></div>
+        </div>
+        <div class="ci">
+          <div class="cdot cx"></div>
+          <div class="cinfo"><div class="cname">nas-home</div><div class="chost">admin@192.168.0.2</div></div>
+        </div>
+      </div>
+      <div style="flex:1"></div>
+      <div class="lsb-foot">
+        <button class="ibt" title="新建连接"><i class="ti ti-plus"></i></button>
+        <button class="ibt" title="导入"><i class="ti ti-file-import"></i></button>
+        <button class="ibt" title="设置"><i class="ti ti-settings"></i></button>
+      </div>
+    </div>
+
+    <div class="dh" id="dh-l"></div>
+
+    <!-- MAIN -->
+    <div class="main">
+      <div class="tabbar">
+        <div class="tab on">
+          <i class="ti ti-terminal"></i>
+          prod-web-01
+          <span class="cx2"><i class="ti ti-x"></i></span>
+        </div>
+        <div class="tab">
+          <i class="ti ti-terminal"></i>
+          prod-web-01 #2
+          <span class="cx2"><i class="ti ti-x"></i></span>
+        </div>
+        <div class="tabsp"></div>
+        <div class="tabact">
+          <div class="tba" title="分屏"><i class="ti ti-layout-columns"></i></div>
+          <div class="tba" id="rs-tog" title="文件面板"><i class="ti ti-layout-sidebar-right"></i></div>
+          <div class="tba"><i class="ti ti-dots-vertical"></i></div>
+        </div>
+      </div>
+
+      <div class="panerow">
+        <!-- TERMINAL -->
+        <div class="term" id="term">
+          <div class="tconn">● connected · root@192.168.1.10 · openssh 8.9p1 · aes256-ctr</div>
+
+          <div class="tblk">
+            <div class="tl"><span class="tp">root@prod-web-01</span><span class="tpc">:~$</span><span class="tc"> systemctl status nginx</span></div>
+            <div class="to">● nginx.service - A high performance web server</div>
+            <div class="to">&nbsp;&nbsp;Loaded: loaded (/lib/systemd/system/nginx.service; enabled)</div>
+            <div class="tg">&nbsp;&nbsp;Active: active (running) since Mon 2026-06-15 08:21:03 UTC; 23h ago</div>
+          </div>
+
+          <div class="tblk">
+            <div class="tl"><span class="tp">root@prod-web-01</span><span class="tpc">:~$</span><span class="tc"> docker ps --format "table {{.Names}}\t{{.Status}}"</span></div>
+            <div class="to">NAMES&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; STATUS</div>
+            <div class="tg">app-backend&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Up 3 hours</div>
+            <div class="tg">redis-cache&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Up 3 hours</div>
+            <div class="tr">postgres-db&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Exited (1) 42 min ago</div>
+          </div>
+
+          <div class="tl">
+            <span class="tp">root@prod-web-01</span><span class="tpc">:~$</span>
+            <span class="tc"> /check</span><span class="tcur"></span>
+          </div>
+
+          <!-- SLASH POPUP -->
+          <div class="spop" id="spop">
+            <div class="sphd">
+              <span class="sphd-l">/ commands</span>
+              <span class="sphd-r">↑↓ · Tab · Esc</span>
+            </div>
+            <div class="spi on">
+              <i class="ti ti-bookmark spi-ic"></i>
+              <div class="spi-b">
+                <div class="spi-cmd"><em>/check</em>-disk</div>
+                <div class="spi-desc">df -h &amp;&amp; du -sh /* 2>/dev/null | sort -rh | head -10</div>
+              </div>
+              <span class="spi-tag">snippet</span>
+            </div>
+            <div class="spi">
+              <i class="ti ti-bookmark spi-ic"></i>
+              <div class="spi-b">
+                <div class="spi-cmd"><em>/check</em>-ports</div>
+                <div class="spi-desc">ss -tlnp | grep LISTEN</div>
+              </div>
+              <span class="spi-tag">snippet</span>
+            </div>
+            <div class="spi">
+              <i class="ti ti-clock spi-ic"></i>
+              <div class="spi-b">
+                <div class="spi-cmd">docker ps --format ...</div>
+                <div class="spi-desc">3 分钟前</div>
+              </div>
+              <span class="spi-tag">history</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT SIDEBAR -->
+        <div class="rsb" id="rsb">
+          <div class="rs-tabs">
+            <div class="rst on" data-t="0">files</div>
+            <div class="rst" data-t="1">history</div>
+            <div class="rst" data-t="2">snippets</div>
+            <div class="rs-xcl" id="rsb-x"><i class="ti ti-chevron-right"></i></div>
+          </div>
+          <div class="rsb-body" id="rsb-body">
+            <div id="t0">
+              <div class="ft">
+                <div class="ftd"><i class="ti ti-chevron-down"></i><i class="ti ti-folder-open"></i><span class="dn">/</span><span class="bc">cached</span></div>
+                <div class="ftch">
+                  <div class="ftd"><i class="ti ti-chevron-down"></i><i class="ti ti-folder-open"></i><span class="dn">home</span><span class="bc">cached</span></div>
+                  <div class="ftch">
+                    <div class="ftf" onclick="openFP('.bashrc','4.2k',this)"><i class="ti ti-file-text"></i><span class="fn">.bashrc</span><span class="fsz">4.2k</span></div>
+                    <div class="ftf" onclick="openFP('deploy.sh','1.8k',this)"><i class="ti ti-file-code"></i><span class="fn">deploy.sh</span><span class="fsz">1.8k</span></div>
+                    <div class="ftf" onclick="openFP('app.log','248k',this)"><i class="ti ti-file"></i><span class="fn">app.log</span><span class="fsz">248k</span></div>
+                  </div>
+                  <div class="ftd"><i class="ti ti-chevron-right"></i><i class="ti ti-folder"></i><span class="dn">etc</span><span class="bc">cached</span></div>
+                  <div class="ftd" style="color:var(--t3)"><i class="ti ti-chevron-right"></i><i class="ti ti-folder"></i><span>proc</span><span style="font-size:9px;margin-left:auto;color:var(--t3)">skip</span></div>
+                </div>
+              </div>
+            </div>
+            <div id="t1" style="display:none">
+              <div class="hist-i"><i class="ti ti-terminal"></i><span class="hist-cmd">docker ps --format "table {{.Names}}\t{{.Status}}"</span><span class="hist-t">3m</span></div>
+              <div class="hist-i"><i class="ti ti-terminal"></i><span class="hist-cmd">systemctl status nginx</span><span class="hist-t">8m</span></div>
+              <div class="hist-i"><i class="ti ti-terminal"></i><span class="hist-cmd">tail -f /var/log/app.log</span><span class="hist-t">22m</span></div>
+              <div class="hist-i"><i class="ti ti-terminal"></i><span class="hist-cmd">git pull origin main</span><span class="hist-t">1h</span></div>
+              <div class="hist-i"><i class="ti ti-terminal"></i><span class="hist-cmd">pm2 restart all</span><span class="hist-t">1h</span></div>
+              <div class="hist-i"><i class="ti ti-terminal"></i><span class="hist-cmd">htop</span><span class="hist-t">3h</span></div>
+            </div>
+            <div id="t2" style="display:none">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                <span style="font-size:10px;color:var(--t2);text-transform:uppercase;letter-spacing:0.06em">prod-web-01</span>
+                <div class="fp-ab" style="width:22px;height:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--t2);border-radius:var(--r)"><i class="ti ti-plus"></i></div>
+              </div>
+              <div class="note-b"><div class="note-ttl">disk check</div><div class="note-al">/check-disk</div></div>
+              <div class="note-b"><div class="note-ttl">port scan</div><div class="note-al">/check-ports</div></div>
+              <div class="note-b"><div class="note-ttl">restart app</div><div class="note-al">/restart-app</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- FILE PREVIEW -->
+        <div class="fp" id="fp">
+          <div class="fp-hd">
+            <span class="fp-fn" id="fp-fn"></span>
+            <div class="fp-act">
+              <div class="fp-ab" title="edit"><i class="ti ti-edit"></i></div>
+              <div class="fp-ab" title="download"><i class="ti ti-download"></i></div>
+              <div class="fp-ab" title="close" onclick="closeFP()"><i class="ti ti-x"></i></div>
+            </div>
+          </div>
+          <div class="fp-body" id="fp-body"></div>
+        </div>
+      </div>
+
+      <div class="sbar">
+        <span><span class="sdot"></span>prod-web-01</span>
+        <span class="si2"><i class="ti ti-cpu"></i> 23%</span>
+        <span class="si2"><i class="ti ti-database"></i> 61%</span>
+        <span class="si2"><i class="ti ti-wifi"></i> 12ms</span>
+        <div style="flex:1"></div>
+        <span class="si2 sacc"><i class="ti ti-refresh"></i> file tree cached</span>
+        <span style="color:var(--t3)">·</span>
+        <span class="sskbd">/</span>
+        <span style="color:var(--t3)">commands</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const lsb = document.getElementById('lsb');
+const rsb = document.getElementById('rsb');
+const fp  = document.getElementById('fp');
+const dhL = document.getElementById('dh-l');
+
+document.getElementById('lsb-tog').onclick = () => {
+  lsb.classList.toggle('hide');
+};
+document.getElementById('rs-tog').onclick = () => rsb.classList.toggle('hide');
+document.getElementById('rsb-x').onclick   = () => rsb.classList.toggle('hide');
+
+document.querySelectorAll('.rst[data-t]').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.rst').forEach(x => x.classList.remove('on'));
+    t.classList.add('on');
+    ['t0','t1','t2'].forEach((id, i) => {
+      document.getElementById(id).style.display = (i == t.dataset.t) ? '' : 'none';
+    });
+  };
+});
+
+// Drag-resize left sidebar
+let drag = false, sx, sw;
+dhL.addEventListener('mousedown', e => {
+  drag = true; sx = e.clientX; sw = lsb.offsetWidth;
+  document.body.style.cursor = 'col-resize'; dhL.classList.add('act');
+  e.preventDefault();
+});
+document.addEventListener('mousemove', e => {
+  if (!drag) return;
+  lsb.style.width = Math.max(130, Math.min(300, sw + e.clientX - sx)) + 'px';
+});
+document.addEventListener('mouseup', () => {
+  drag = false; document.body.style.cursor = ''; dhL.classList.remove('act');
+});
+
+// File contents
+const files = {
+  '.bashrc': [
+    ['cmt','# ~/.bashrc — bash configuration'],
+    [],
+    ['kw','export ','t0c','PATH','t0c','="$HOME/.local/bin:$PATH"'],
+    ['kw','export ','t0c','EDITOR','t0c','="nvim"'],
+    ['kw','export ','t0c','HISTSIZE','t0c','=10000'],
+    [],
+    ['cmt','# aliases'],
+    ['kw','alias ','t0c','ll','t0c','="ls -alF --color=auto"'],
+    ['kw','alias ','t0c','gs','t0c','="git status"'],
+    ['kw','alias ','t0c','gp','t0c','="git pull"'],
+    [],
+    ['fn2','source ','t0c','~/.bash_profile'],
+  ],
+  'deploy.sh': [
+    ['cmt','#!/bin/bash'],
+    ['cmt','# deploy.sh — production deploy script'],
+    [],
+    ['kw','set ','t0c','-euo pipefail'],
+    [],
+    ['fn2','echo ','str','"[deploy] pulling latest..."'],
+    ['fn2','git ','t0c','-C $APP_DIR pull origin main'],
+    ['fn2','npm ','t0c','--prefix $APP_DIR install --production'],
+    ['fn2','pm2 ','t0c','restart all --update-env'],
+    [],
+    ['fn2','echo ','str','"[deploy] done ✓"'],
+  ],
+  'app.log': [
+    ['t0c','2026-06-15 08:21:03 INFO  ','t0c','nginx started'],
+    ['t0c','2026-06-15 09:10:44 INFO  ','t0c','GET /api/health 200 (4ms)'],
+    ['t0c','2026-06-15 09:41:02 INFO  ','t0c','GET /api/data 200 (12ms)'],
+    ['trc','2026-06-15 10:13:27 ERROR ','trc','postgres: connection refused'],
+    ['trc','2026-06-15 10:13:29 ERROR ','trc','retry 1/3 failed'],
+    ['trc','2026-06-15 10:13:31 ERROR ','trc','retry 2/3 failed'],
+    ['trc','2026-06-15 10:13:33 FATAL ','trc','postgres unavailable, exiting'],
+  ]
+};
+
+function openFP(name, size, el) {
+  document.querySelectorAll('.ftf').forEach(x => x.classList.remove('sel'));
+  el.classList.add('sel');
+  document.getElementById('fp-fn').textContent = name + ' · ' + size;
+  const lines = files[name] || [];
+  document.getElementById('fp-body').innerHTML = lines.map((parts, i) => {
+    const ln = `<span class="fln">${i + 1}</span>`;
+    if (!parts.length) return `<span class="fl">${ln}</span>`;
+    let h = '';
+    for (let j = 0; j < parts.length; j++) {
+      const cls = parts[j], nxt = parts[j + 1];
+      if (['kw','str','cmt','fn2','t0c','trc'].includes(cls) && nxt !== undefined) {
+        h += `<span class="${cls}">${nxt}</span>`; j++;
+      } else { h += cls; }
+    }
+    return `<span class="fl">${ln}${h}</span>`;
+  }).join('\n');
+  fp.classList.add('open');
+  if (rsb.classList.contains('hide')) rsb.classList.remove('hide');
+}
+
+function closeFP() {
+  fp.classList.remove('open');
+  document.querySelectorAll('.ftf').forEach(x => x.classList.remove('sel'));
+}
+
+document.querySelectorAll('.spi').forEach(el => {
+  el.onmouseenter = () => {
+    document.querySelectorAll('.spi').forEach(x => x.classList.remove('on'));
+    el.classList.add('on');
+  };
+});
+</script>
+</body>
+</html>
