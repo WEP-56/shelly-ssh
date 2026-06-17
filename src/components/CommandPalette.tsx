@@ -130,17 +130,6 @@ export function CommandPalette() {
     setSelected(0)
   }, [query])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === '/' && e.ctrlKey) {
-        e.preventDefault()
-        setCommandPaletteOpen(true)
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [setCommandPaletteOpen])
-
   if (!commandPaletteOpen) return null
 
   const run = (item?: CommandItem) => {

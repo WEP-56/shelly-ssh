@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, type Connection, type RightDockTab } from '../store'
 import {
   listFileJobs,
@@ -14,7 +14,8 @@ import {
   type RemoteFileEntry,
 } from '../lib/files'
 import { deleteSnippet, saveSnippet } from '../lib/db'
-import { AgentPanel } from './AgentPanel'
+
+const AgentPanel = lazy(() => import('./AgentPanel').then(module => ({ default: module.AgentPanel })))
 
 type PreviewState = { path: string; content: string }
 type CreateDraft = { kind: 'file' | 'folder'; parentPath: string; name: string }
@@ -23,7 +24,17 @@ type FileContextMenu = { x: number; y: number; entry?: RemoteFileEntry }
 
 export function ContextDock({ active, onClose }: { active: Connection | undefined; onClose: () => void }) {
   const { rightTab, setRightTab, rightDockWidth, setRightDockWidth } = useStore(s => s)
+  const [mountedTabs, setMountedTabs] = useState<Record<RightDockTab, boolean>>(() => ({
+    files: rightTab === 'files',
+    history: rightTab === 'history',
+    snippets: rightTab === 'snippets',
+    agent: rightTab === 'agent',
+  }))
   const dragRef = useRef<{ startX: number; startW: number } | null>(null)
+
+  useEffect(() => {
+    setMountedTabs(prev => prev[rightTab] ? prev : { ...prev, [rightTab]: true })
+  }, [rightTab])
 
   const onResizeDown = (e: React.MouseEvent) => {
     dragRef.current = { startX: e.clientX, startW: rightDockWidth }
@@ -57,18 +68,28 @@ export function ContextDock({ active, onClose }: { active: Connection | undefine
         <button style={s.close} onClick={onClose}><i className="ti ti-chevron-right" /></button>
       </div>
       <div style={s.body}>
-        <div style={{ ...s.view, display: rightTab === 'files' ? 'block' : 'none' }}>
-          <FilesPanel active={active} />
-        </div>
-        <div style={{ ...s.view, display: rightTab === 'history' ? 'block' : 'none' }}>
-          <HistoryPanel width={rightDockWidth} />
-        </div>
-        <div style={{ ...s.view, display: rightTab === 'snippets' ? 'block' : 'none' }}>
-          <SnippetsPanel width={rightDockWidth} />
-        </div>
-        <div style={{ ...s.view, display: rightTab === 'agent' ? 'block' : 'none' }}>
-          <AgentPanel active={active} width={rightDockWidth} />
-        </div>
+        {mountedTabs.files && (
+          <div style={{ ...s.view, display: rightTab === 'files' ? 'block' : 'none' }}>
+            <FilesPanel active={active} />
+          </div>
+        )}
+        {mountedTabs.history && (
+          <div style={{ ...s.view, display: rightTab === 'history' ? 'block' : 'none' }}>
+            <HistoryPanel width={rightDockWidth} />
+          </div>
+        )}
+        {mountedTabs.snippets && (
+          <div style={{ ...s.view, display: rightTab === 'snippets' ? 'block' : 'none' }}>
+            <SnippetsPanel width={rightDockWidth} />
+          </div>
+        )}
+        {mountedTabs.agent && (
+          <div style={{ ...s.view, display: rightTab === 'agent' ? 'block' : 'none' }}>
+            <Suspense fallback={<div style={s.loading}>loading agent...</div>}>
+              <AgentPanel active={active} width={rightDockWidth} />
+            </Suspense>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -106,6 +127,10 @@ function FilesPanel({ active }: { active: Connection | undefined }) {
   }, [jobs, selectedPath])
 
   useEffect(() => {
+    if (!active?.id) {
+      setJobs([])
+      return
+    }
     listFileJobs(active?.id).then(setJobs).catch(err => console.warn('[files] list jobs failed', err))
   }, [active?.id])
 
@@ -126,6 +151,7 @@ function FilesPanel({ active }: { active: Connection | undefined }) {
   }, [selectedByDevice])
 
   useEffect(() => {
+    if (!active?.id) return
     let unlisten: (() => void) | undefined
     onFileJobUpdated(job => {
       if (active?.id && job.deviceId !== active.id) return
@@ -747,6 +773,7 @@ const s: Record<string, React.CSSProperties> = {
   close: { background:'none', border:'none', color:'#686868', cursor:'pointer', padding:'0 6px', fontSize:11, display:'flex', alignItems:'center' },
   body: { flex:1, minHeight:0, overflow:'hidden' },
   view: { height:'100%', minHeight:0 },
+  loading: { padding:12, color:'#454545', fontSize:11, fontFamily:'var(--fm)' },
   panel: { height:'100%', minHeight:0, overflowY:'auto', padding:8, display:'flex', flexDirection:'column', gap:8 },
   empty: { fontSize:11, color:'#454545', padding:'14px 8px', textAlign:'center', lineHeight:1.7 },
   fileWorkspace: { height:'100%', minHeight:0, display:'flex', background:'#1e1e1e' },

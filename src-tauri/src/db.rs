@@ -180,6 +180,28 @@ pub struct AiMessage {
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiToolRun {
+    pub id: String,
+    pub conversation_id: String,
+    pub server_key: String,
+    pub session_id: Option<String>,
+    pub message_id: Option<String>,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub args_json: String,
+    pub command: Option<String>,
+    pub risk_level: String,
+    pub approval_status: String,
+    pub run_status: String,
+    pub output: Option<String>,
+    pub exit_code: Option<i64>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub created_at: i64,
+}
+
 impl Db {
     pub fn open(app: &AppHandle) -> Result<Self, String> {
         let data_dir = app
@@ -276,6 +298,100 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn create_ai_tool_run(
+        &self,
+        conversation_id: &str,
+        server_key: &str,
+        session_id: Option<&str>,
+        message_id: Option<&str>,
+        tool_call_id: &str,
+        tool_name: &str,
+        args_json: &str,
+        command: Option<&str>,
+        risk_level: &str,
+    ) -> Result<AiToolRun, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        insert_ai_tool_run(
+            &conn,
+            conversation_id,
+            server_key,
+            session_id,
+            message_id,
+            tool_call_id,
+            tool_name,
+            args_json,
+            command,
+            risk_level,
+        )
+    }
+
+    pub fn set_ai_tool_approval(&self, tool_run_id: &str, approval_status: &str) -> Result<AiToolRun, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let run_status = match approval_status {
+            "approved" => "approved",
+            "denied" => "denied",
+            _ => "pending",
+        };
+        conn.execute(
+            "UPDATE ai_tool_runs
+             SET approval_status = ?1, run_status = ?2
+             WHERE id = ?3",
+            params![approval_status, run_status, tool_run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        get_ai_tool_run(&conn, tool_run_id)
+    }
+
+    pub fn ai_tool_run(&self, tool_run_id: &str) -> Result<AiToolRun, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        get_ai_tool_run(&conn, tool_run_id)
+    }
+
+    pub fn start_ai_tool_run(&self, tool_run_id: &str, session_id: &str) -> Result<AiToolRun, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        conn.execute(
+            "UPDATE ai_tool_runs
+             SET approval_status = 'approved', run_status = 'running', session_id = ?1, started_at = ?2
+             WHERE id = ?3",
+            params![session_id, now_ms(), tool_run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        get_ai_tool_run(&conn, tool_run_id)
+    }
+
+    pub fn finish_ai_tool_run(
+        &self,
+        tool_run_id: &str,
+        run_status: &str,
+        output: &str,
+        exit_code: Option<i64>,
+    ) -> Result<AiToolRun, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        conn.execute(
+            "UPDATE ai_tool_runs
+             SET run_status = ?1, output = ?2, exit_code = ?3, completed_at = ?4
+             WHERE id = ?5",
+            params![run_status, output, exit_code, now_ms(), tool_run_id],
+        )
+        .map_err(|e| e.to_string())?;
+        get_ai_tool_run(&conn, tool_run_id)
     }
 }
 
@@ -1437,6 +1553,98 @@ fn insert_ai_message(
     )
     .map_err(|e| e.to_string())?;
     Ok(msg)
+}
+
+fn ai_tool_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiToolRun> {
+    Ok(AiToolRun {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        server_key: row.get(2)?,
+        session_id: row.get(3)?,
+        message_id: row.get(4)?,
+        tool_call_id: row.get(5)?,
+        tool_name: row.get(6)?,
+        args_json: row.get(7)?,
+        command: row.get(8)?,
+        risk_level: row.get(9)?,
+        approval_status: row.get(10)?,
+        run_status: row.get(11)?,
+        output: row.get(12)?,
+        exit_code: row.get(13)?,
+        started_at: row.get(14)?,
+        completed_at: row.get(15)?,
+        created_at: row.get(16)?,
+    })
+}
+
+fn insert_ai_tool_run(
+    conn: &Connection,
+    conversation_id: &str,
+    server_key: &str,
+    session_id: Option<&str>,
+    message_id: Option<&str>,
+    tool_call_id: &str,
+    tool_name: &str,
+    args_json: &str,
+    command: Option<&str>,
+    risk_level: &str,
+) -> Result<AiToolRun, String> {
+    let run = AiToolRun {
+        id: Uuid::new_v4().to_string(),
+        conversation_id: conversation_id.to_string(),
+        server_key: server_key.to_string(),
+        session_id: session_id.map(ToString::to_string),
+        message_id: message_id.map(ToString::to_string),
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        args_json: args_json.to_string(),
+        command: command.map(ToString::to_string),
+        risk_level: risk_level.to_string(),
+        approval_status: "pending".to_string(),
+        run_status: "pending".to_string(),
+        output: None,
+        exit_code: None,
+        started_at: None,
+        completed_at: None,
+        created_at: now_ms(),
+    };
+    conn.execute(
+        "INSERT INTO ai_tool_runs
+         (id, conversation_id, server_key, session_id, message_id, tool_call_id, tool_name,
+          args_json, command, risk_level, approval_status, run_status, output, exit_code,
+          started_at, completed_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, NULL, NULL, ?13)",
+        params![
+            run.id,
+            run.conversation_id,
+            run.server_key,
+            run.session_id,
+            run.message_id,
+            run.tool_call_id,
+            run.tool_name,
+            run.args_json,
+            run.command,
+            run.risk_level,
+            run.approval_status,
+            run.run_status,
+            run.created_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(run)
+}
+
+fn get_ai_tool_run(conn: &Connection, id: &str) -> Result<AiToolRun, String> {
+    conn.query_row(
+        "SELECT id, conversation_id, server_key, session_id, message_id, tool_call_id, tool_name,
+                args_json, command, risk_level, approval_status, run_status, output, exit_code,
+                started_at, completed_at, created_at
+         FROM ai_tool_runs
+         WHERE id = ?1",
+        params![id],
+        ai_tool_run_from_row,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn list_history_with_params<P>(

@@ -1,36 +1,31 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { useRef, useCallback, useEffect } from 'react'
+import { Suspense, lazy, useRef, useCallback, useEffect } from 'react'
 import { useStore, type Connection } from './store'
 import { Sidebar } from './components/Sidebar'
-import { TerminalView } from './components/TerminalView'
-import { LocalTerminal } from './components/LocalTerminal'
-import { ConnectDialog } from './components/ConnectDialog'
-import { CommandPalette } from './components/CommandPalette'
-import { ContextDock } from './components/ContextDock'
-import { AgentPanel } from './components/AgentPanel'
-import { SettingsDialog } from './components/SettingsDialog'
 import { listCommandHistory, listDevices, listSnippets, updateDeviceSession } from './lib/db'
 import { sshDisconnect } from './lib/ssh'
 
 const win = getCurrentWindow()
+const TerminalView = lazy(() => import('./components/TerminalView').then(module => ({ default: module.TerminalView })))
+const LocalTerminal = lazy(() => import('./components/LocalTerminal').then(module => ({ default: module.LocalTerminal })))
+const ConnectDialog = lazy(() => import('./components/ConnectDialog').then(module => ({ default: module.ConnectDialog })))
+const CommandPalette = lazy(() => import('./components/CommandPalette').then(module => ({ default: module.CommandPalette })))
+const ContextDock = lazy(() => import('./components/ContextDock').then(module => ({ default: module.ContextDock })))
+const AgentPanel = lazy(() => import('./components/AgentPanel').then(module => ({ default: module.AgentPanel })))
+const SettingsDialog = lazy(() => import('./components/SettingsDialog').then(module => ({ default: module.SettingsDialog })))
 
 export default function App() {
   const { conns, activeId, rightOpen, showConnect, toggleRight, sidebarOpen, toggleSidebar,
           localOpen, localHeight, bottomPanelMode, toggleLocal, setLocalHeight, setCommandPaletteOpen,
-          setConns, setCommandHistory, setCommandSnippets } = useStore(s => s)
+          commandPaletteOpen, showSettings, setConns, setCommandHistory, setCommandSnippets } = useStore(s => s)
   const active = conns.find(c => c.id === activeId)
 
   useEffect(() => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        win.show().catch(err => console.warn('[window] show failed', err))
-      })
-    })
-  }, [])
-
-  useEffect(() => {
-    Promise.all([listDevices(), listCommandHistory(undefined, 100), listSnippets()])
-      .then(([devices, history, snippets]) => {
+    let cancelled = false
+    const hydrate = async () => {
+      try {
+        const devices = await listDevices()
+        if (cancelled) return
         setConns(devices.map(device => ({
           id: device.id,
           name: device.name,
@@ -40,22 +35,49 @@ export default function App() {
           status: 'disconnected',
           rememberPassword: device.rememberPassword,
         })))
-        setCommandHistory(history.map(entry => ({
-          id: entry.id,
-          command: entry.command,
-          connectionName: devices.find(device => device.id === entry.deviceId)?.name,
-          lastUsedAt: entry.createdAt,
-        })))
-        setCommandSnippets(snippets.map(snippet => ({
-          id: snippet.id,
-          name: snippet.name,
-          command: snippet.command,
-          createdAt: snippet.createdAt,
-          updatedAt: snippet.updatedAt,
-        })))
-      })
-      .catch(err => console.warn('[db] hydrate failed', err))
+        window.setTimeout(async () => {
+          try {
+            const [history, snippets] = await Promise.all([listCommandHistory(undefined, 100), listSnippets()])
+            if (cancelled) return
+            setCommandHistory(history.map(entry => ({
+              id: entry.id,
+              command: entry.command,
+              connectionName: devices.find(device => device.id === entry.deviceId)?.name,
+              lastUsedAt: entry.createdAt,
+            })))
+            setCommandSnippets(snippets.map(snippet => ({
+              id: snippet.id,
+              name: snippet.name,
+              command: snippet.command,
+              createdAt: snippet.createdAt,
+              updatedAt: snippet.updatedAt,
+            })))
+          } catch (err) {
+            console.warn('[db] history/snippets hydrate failed', err)
+          }
+        }, 80)
+      } catch (err) {
+        console.warn('[db] devices hydrate failed', err)
+      }
+    }
+    requestAnimationFrame(() => {
+      win.show()
+        .catch(err => console.warn('[window] show failed', err))
+        .finally(() => window.setTimeout(hydrate, 0))
+    })
+    return () => { cancelled = true }
   }, [setCommandHistory, setCommandSnippets, setConns])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === '/' && e.ctrlKey) {
+        e.preventDefault()
+        setCommandPaletteOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [setCommandPaletteOpen])
 
   // Vertical drag-resize for local panel
   const dragState = useRef<{ startY: number; startH: number } | null>(null)
@@ -111,12 +133,18 @@ export default function App() {
           <div style={s.panerow}>
             <div style={s.terminalStack}>
               {conns.filter(c => c.status === 'connected' && c.sessionId).map(c => (
-                <TerminalView key={c.sessionId} sessionId={c.sessionId ?? null} visible={c.id === activeId} />
+                <Suspense key={c.sessionId} fallback={null}>
+                  <TerminalView sessionId={c.sessionId ?? null} visible={c.id === activeId} />
+                </Suspense>
               ))}
               {active?.status !== 'connected' && <Welcome />}
             </div>
 
-            {rightOpen && <ContextDock active={active} onClose={toggleRight} />}
+            {rightOpen && (
+              <Suspense fallback={<DockFallback onClose={toggleRight} />}>
+                <ContextDock active={active} onClose={toggleRight} />
+              </Suspense>
+            )}
           </div>
 
           {/* Bottom panel */}
@@ -131,9 +159,11 @@ export default function App() {
                   <button style={s.lpBtn} onClick={toggleLocal}><i className="ti ti-x" style={{ fontSize:11 }} /></button>
                 </div>
                 <div style={{ flex:1, minHeight:0 }}>
-                  {bottomPanelMode === 'agent'
-                    ? <AgentPanel active={active} width={900} />
-                    : <LocalTerminal height={localHeight} />}
+                  <Suspense fallback={<PanelFallback />}>
+                    {bottomPanelMode === 'agent'
+                      ? <AgentPanel active={active} width={900} />
+                      : <LocalTerminal height={localHeight} />}
+                  </Suspense>
                 </div>
               </div>
             </div>
@@ -153,11 +183,28 @@ export default function App() {
         </div>
       </div>
 
-      {showConnect && <ConnectDialog />}
-      <SettingsDialog />
-      <CommandPalette />
+      <Suspense fallback={null}>
+        {showConnect && <ConnectDialog />}
+        {showSettings && <SettingsDialog />}
+        {commandPaletteOpen && <CommandPalette />}
+      </Suspense>
     </div>
   )
+}
+
+function DockFallback({ onClose }: { onClose: () => void }) {
+  return (
+    <div style={s.dockFallback}>
+      <div style={s.dockFallbackTabs}>
+        <span>files</span>
+        <button style={s.rsbClose} onClick={onClose}><i className="ti ti-chevron-right" /></button>
+      </div>
+    </div>
+  )
+}
+
+function PanelFallback() {
+  return <div style={s.panelFallback}>loading...</div>
 }
 
 function Welcome() {
@@ -245,6 +292,9 @@ const s: Record<string, React.CSSProperties> = {
   rsbClose: { background:'none', border:'none', color:'#454545', cursor:'pointer', padding:'0 6px', fontSize:11 },
   rsbBody: { flex:1, overflowY:'auto', padding:8 },
   hint2: { fontSize:11, color:'#454545', padding:'14px 8px', textAlign:'center', lineHeight:1.7 },
+  dockFallback: { width:280, flexShrink:0, background:'#1e1e1e', borderLeft:'1px solid rgba(0,0,0,0.4)', display:'flex', flexDirection:'column' },
+  dockFallbackTabs: { height:30, display:'flex', alignItems:'center', justifyContent:'space-between', borderBottom:'1px solid rgba(0,0,0,0.4)', color:'#686868', fontSize:10.5, padding:'0 6px 0 12px' },
+  panelFallback: { height:'100%', display:'flex', alignItems:'center', justifyContent:'center', color:'#454545', fontSize:11, fontFamily:'var(--fm)' },
   sbar: { display:'flex', alignItems:'center', gap:8, padding:'3px 12px', background:'#569cd6', fontSize:10, color:'rgba(0,0,0,0.75)', flexShrink:0, fontFamily:'var(--fm)' },
   si2: { display:'flex', alignItems:'center', gap:3, fontSize:10 },
   cmdBtn: { marginLeft:'auto', display:'flex', gap:8, alignItems:'center', border:'none', background:'transparent', color:'rgba(0,0,0,0.75)', fontFamily:'var(--fm)', fontSize:10, cursor:'pointer', padding:0 },

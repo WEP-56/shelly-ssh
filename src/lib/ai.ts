@@ -96,9 +96,69 @@ export interface AiStreamChunkEvent {
   delta: string
 }
 
+export interface AiStreamResetEvent {
+  conversationId: string
+  message: string
+}
+
 export interface AiErrorEvent {
   conversationId: string
   message: string
+}
+
+export interface AiToolApprovalEvent {
+  conversationId: string
+  toolRunId: string
+  toolCallId: string
+  toolName: string
+  serverKey: string
+  sessionId?: string | null
+  argsJson: string
+  command?: string | null
+  purpose?: string | null
+  interactionTip?: string | null
+  riskLevel: string
+  riskReasons: string[]
+}
+
+export interface AiToolRun {
+  id: string
+  conversationId: string
+  serverKey: string
+  sessionId?: string | null
+  messageId?: string | null
+  toolCallId: string
+  toolName: string
+  argsJson: string
+  command?: string | null
+  riskLevel: string
+  approvalStatus: string
+  runStatus: string
+  output?: string | null
+  exitCode?: number | null
+  startedAt?: number | null
+  completedAt?: number | null
+  createdAt: number
+}
+
+export interface AiToolStartedEvent {
+  conversationId: string
+  toolRunId: string
+  command: string
+}
+
+export interface AiToolOutputEvent {
+  conversationId: string
+  toolRunId: string
+  output: string
+}
+
+export interface AiToolResultEvent {
+  conversationId: string
+  toolRunId: string
+  runStatus: string
+  output: string
+  timedOut: boolean
 }
 
 export interface TerminalSnapshot {
@@ -149,11 +209,42 @@ export const sendAiMessage = (
 export const readTerminal = (sessionId: string, lines = 120): Promise<TerminalSnapshot> =>
   invoke('ai_read_terminal', { sessionId, lines })
 
+export const approveAiTool = (toolRunId: string): Promise<AiToolRun> =>
+  invoke('ai_approve_tool', { input: { toolRunId } })
+
+export const denyAiTool = (toolRunId: string): Promise<AiToolRun> =>
+  invoke('ai_deny_tool', { input: { toolRunId } })
+
+export const executeApprovedAiTool = (toolRunId: string, activeSessionId: string): Promise<AiToolRun> =>
+  invoke('ai_execute_approved_tool', { input: { toolRunId, activeSessionId } })
+
+export const completeInteractiveAiTool = (
+  toolRunId: string,
+  activeSessionId: string,
+  output: string,
+): Promise<AiToolRun> =>
+  invoke('ai_complete_interactive_tool', { input: { toolRunId, activeSessionId, output } })
+
 export const onAiStatus = (cb: (event: AiStatusEvent) => void): Promise<UnlistenFn> =>
   listen<AiStatusEvent>('ai-status', e => cb(e.payload))
 
 export const onAiStreamChunk = (cb: (event: AiStreamChunkEvent) => void): Promise<UnlistenFn> =>
   listen<AiStreamChunkEvent>('ai-stream-chunk', e => cb(e.payload))
 
+export const onAiStreamReset = (cb: (event: AiStreamResetEvent) => void): Promise<UnlistenFn> =>
+  listen<AiStreamResetEvent>('ai-stream-reset', e => cb(e.payload))
+
 export const onAiError = (cb: (event: AiErrorEvent) => void): Promise<UnlistenFn> =>
   listen<AiErrorEvent>('ai-error', e => cb(e.payload))
+
+export const onAiToolApproval = (cb: (event: AiToolApprovalEvent) => void): Promise<UnlistenFn> =>
+  listen<AiToolApprovalEvent>('ai-tool-approval', e => cb(e.payload))
+
+export const onAiToolStarted = (cb: (event: AiToolStartedEvent) => void): Promise<UnlistenFn> =>
+  listen<AiToolStartedEvent>('ai-tool-started', e => cb(e.payload))
+
+export const onAiToolOutput = (cb: (event: AiToolOutputEvent) => void): Promise<UnlistenFn> =>
+  listen<AiToolOutputEvent>('ai-tool-output', e => cb(e.payload))
+
+export const onAiToolResult = (cb: (event: AiToolResultEvent) => void): Promise<UnlistenFn> =>
+  listen<AiToolResultEvent>('ai-tool-result', e => cb(e.payload))

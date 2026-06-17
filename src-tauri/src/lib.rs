@@ -3,7 +3,10 @@ mod db;
 mod file_jobs;
 mod local_term;
 mod ssh;
-use ai::{ai_read_terminal, ai_send_message};
+use ai::{
+    ai_approve_tool, ai_complete_interactive_tool, ai_deny_tool, ai_execute_approved_tool,
+    ai_read_terminal, ai_send_message,
+};
 use db::{
     db_bind_ai_conversation_session, db_create_ai_conversation, db_delete_ai_conversation,
     db_delete_ai_provider, db_get_ai_conversation, db_list_ai_conversations,
@@ -68,6 +71,10 @@ pub fn run() {
             db_list_ai_messages,
             ai_read_terminal,
             ai_send_message,
+            ai_approve_tool,
+            ai_deny_tool,
+            ai_execute_approved_tool,
+            ai_complete_interactive_tool,
             file_queue_list_dir,
             file_queue_preview,
             file_queue_download,
