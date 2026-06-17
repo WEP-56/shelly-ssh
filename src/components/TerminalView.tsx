@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -6,14 +6,27 @@ import '@xterm/xterm/css/xterm.css'
 import { sshInput, sshResize, onSshData, onSshClosed } from '../lib/ssh'
 import { useStore } from '../store'
 
-export function TerminalView({ sessionId }: { sessionId: string | null }) {
+export function TerminalView({ sessionId, visible = true }: { sessionId: string | null; visible?: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
+  const [ready, setReady] = useState(false)
   const patchConn = useStore(s => s.patchConn)
+
+  const fitSafely = () => {
+    const el = containerRef.current
+    if (!el || !fitRef.current) return
+    if (el.clientWidth <= 0 || el.clientHeight <= 0) return
+    try {
+      fitRef.current.fit()
+    } catch (err) {
+      console.warn('[terminal] fit failed', err)
+    }
+  }
 
   // init terminal once
   useEffect(() => {
+    if (!visible || termRef.current) return
     if (!containerRef.current) return
     const term = new Terminal({
       theme: { background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#569cd6',
@@ -25,20 +38,27 @@ export function TerminalView({ sessionId }: { sessionId: string | null }) {
     term.loadAddon(fit)
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
-    fit.fit()
     termRef.current = term
     fitRef.current = fit
-    const ro = new ResizeObserver(() => fit.fit())
+    setReady(true)
+    requestAnimationFrame(fitSafely)
+    const ro = new ResizeObserver(() => fitSafely())
     ro.observe(containerRef.current)
-    return () => { ro.disconnect(); term.dispose() }
-  }, [])
+    return () => {
+      ro.disconnect()
+      term.dispose()
+      termRef.current = null
+      fitRef.current = null
+      setReady(false)
+    }
+  }, [visible])
 
   // wire session
   useEffect(() => {
-    if (!sessionId || !termRef.current) return
+    if (!sessionId || !ready || !termRef.current) return
     const term = termRef.current
     term.reset()
-    fitRef.current?.fit()
+    requestAnimationFrame(fitSafely)
 
     let unData: (() => void) | null = null
     let unClosed: (() => void) | null = null
@@ -59,10 +79,23 @@ export function TerminalView({ sessionId }: { sessionId: string | null }) {
     const d2 = term.onResize(({ cols, rows }) => sshResize(sessionId, cols, rows))
 
     return () => { unData?.(); unClosed?.(); d1.dispose(); d2.dispose() }
-  }, [sessionId, patchConn])
+  }, [sessionId, patchConn, ready])
+
+  useEffect(() => {
+    if (!visible) return
+    requestAnimationFrame(fitSafely)
+  }, [visible])
 
   return (
-    <div style={{ flex:1, minWidth:0, minHeight:0, background:'#1e1e1e', padding:'10px 14px', overflow:'hidden' }}>
+    <div style={{
+      position:'absolute',
+      inset:0,
+      visibility: visible ? 'visible' : 'hidden',
+      pointerEvents: visible ? 'auto' : 'none',
+      background:'#1e1e1e',
+      padding:'10px 14px',
+      overflow:'hidden',
+    }}>
       <div ref={containerRef} style={{ width:'100%', height:'100%' }} />
     </div>
   )

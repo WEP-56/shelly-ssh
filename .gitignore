@@ -31,3 +31,6 @@ Thumbs.db
 
 # Temp
 gen_index.py
+docs/development-plan.md
+docs/agent-terminal-implementation.md
+docs/handover.md
