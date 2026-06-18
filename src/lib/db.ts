@@ -6,8 +6,11 @@ export interface DeviceRecord {
   host: string
   port: number
   username: string
+  authMethod: 'password' | 'privateKey'
+  privateKeyPath?: string | null
   sessionId?: string | null
   rememberPassword: boolean
+  pinned: boolean
   createdAt: number
   updatedAt: number
 }
@@ -18,6 +21,8 @@ export interface SaveDeviceInput {
   host: string
   port: number
   username: string
+  authMethod?: 'password' | 'privateKey'
+  privateKeyPath?: string | null
   rememberPassword: boolean
 }
 
@@ -51,6 +56,9 @@ export const saveDevice = (input: SaveDeviceInput): Promise<DeviceRecord> =>
 export const updateDeviceSession = (deviceId: string, sessionId: string | null): Promise<void> =>
   invoke('db_update_device_session', { deviceId, sessionId })
 
+export const setDevicePinned = (deviceId: string, pinned: boolean): Promise<DeviceRecord> =>
+  invoke('db_set_device_pinned', { deviceId, pinned })
+
 export const deleteDevice = (id: string): Promise<void> =>
   invoke('db_delete_device', { id })
 
@@ -68,6 +76,12 @@ export const listCommandHistory = (deviceId?: string, limit = 100): Promise<Comm
 
 export const addCommandHistory = (command: string, deviceId?: string): Promise<CommandHistoryRecord> =>
   invoke('db_add_command_history', { command, deviceId: deviceId ?? null })
+
+export const deleteCommandHistory = (id: string): Promise<void> =>
+  invoke('db_delete_command_history', { id })
+
+export const clearCommandHistory = (deviceId?: string): Promise<void> =>
+  invoke('db_clear_command_history', { deviceId: deviceId ?? null })
 
 export const listSnippets = (): Promise<SnippetRecord[]> =>
   invoke('db_list_snippets')

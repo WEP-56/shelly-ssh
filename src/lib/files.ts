@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export type FileJobKind = 'listDir' | 'download' | 'upload' | 'delete' | 'rename' | 'mkdir' | 'createFile' | 'preview'
 export type FileJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled'
+export type UploadConflictPolicy = 'overwrite' | 'skip' | 'fail'
 
 export interface FileJob {
   id: string
@@ -16,8 +17,15 @@ export interface FileJob {
   message?: string | null
   entries?: RemoteFileEntry[] | null
   content?: string | null
+  failedEntries?: FileJobFailure[] | null
   createdAt: number
   updatedAt: number
+}
+
+export interface FileJobFailure {
+  localPath: string
+  remotePath: string
+  message: string
 }
 
 export interface RemoteFileEntry {
@@ -48,8 +56,9 @@ export const queueUpload = (
   sessionId: string | null,
   localPath: string,
   remotePath: string,
+  conflictPolicy: UploadConflictPolicy = 'overwrite',
 ): Promise<FileJob> =>
-  invoke('file_queue_upload', { deviceId, sessionId, localPath, remotePath })
+  invoke('file_queue_upload', { deviceId, sessionId, localPath, remotePath, conflictPolicy })
 
 export const queueDelete = (
   deviceId: string,

@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
+import { useI18n, type I18nKey } from '../i18n'
+import { sendCommandToActiveTerminal } from '../lib/commands'
 
 type CommandKind = 'slash' | 'history' | 'snippet'
 
@@ -9,19 +11,17 @@ interface CommandItem {
   title: string
   detail: string
   hint: string
-  action?: () => void
-}
-
-const kindLabel: Record<CommandKind, string> = {
-  slash: 'command',
-  history: 'history',
-  snippet: 'snippet',
+  command?: string
+  action?: () => void | Promise<void>
 }
 
 export function CommandPalette() {
+  const { t } = useI18n()
   const inputRef = useRef<HTMLInputElement>(null)
-  const [query, setQuery] = useState('/')
+  const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
+  const [editorDraft, setEditorDraft] = useState<string | null>(null)
+  const [err, setErr] = useState('')
   const {
     commandPaletteOpen,
     setCommandPaletteOpen,
@@ -29,6 +29,8 @@ export function CommandPalette() {
     commandSnippets,
     openConnectDialog,
     toggleLocal,
+    setLocalOpen,
+    setBottomPanelMode,
     setRightOpen,
     setRightTab,
   } = useStore(s => s)
@@ -36,60 +38,68 @@ export function CommandPalette() {
   const items = useMemo<CommandItem[]>(() => {
     const slashItems: CommandItem[] = [
       {
+        id: 'slash-edit',
+        kind: 'slash',
+        title: '/edit',
+        detail: t('command.editDetail'),
+        hint: t('command.longCommand'),
+        action: () => setEditorDraft(queryToCommand(query)),
+      },
+      {
         id: 'slash-connect',
         kind: 'slash',
         title: '/connect',
-        detail: 'Create a new SSH connection',
-        hint: 'open dialog',
+        detail: t('command.connectDetail'),
+        hint: t('command.openDialog'),
         action: () => openConnectDialog(),
       },
       {
         id: 'slash-local',
         kind: 'slash',
         title: '/local',
-        detail: 'Toggle the local terminal panel',
-        hint: 'toggle panel',
+        detail: t('command.localDetail'),
+        hint: t('command.togglePanel'),
         action: toggleLocal,
       },
       {
         id: 'slash-files',
         kind: 'slash',
         title: '/files',
-        detail: 'Open remote file jobs in the right dock',
-        hint: 'open dock',
+        detail: t('command.filesDetail'),
+        hint: t('command.openDock'),
         action: () => { setRightTab('files'); setRightOpen(true) },
       },
       {
         id: 'slash-history',
         kind: 'slash',
         title: '/history',
-        detail: 'Show recent commands in the right dock',
-        hint: 'open dock',
+        detail: t('command.historyDetail'),
+        hint: t('command.openDock'),
         action: () => { setRightTab('history'); setRightOpen(true) },
       },
       {
         id: 'slash-snippets',
         kind: 'slash',
         title: '/snippets',
-        detail: 'Browse saved command snippets',
-        hint: 'open dock',
+        detail: t('command.snippetsDetail'),
+        hint: t('command.openDock'),
         action: () => { setRightTab('snippets'); setRightOpen(true) },
       },
       {
         id: 'slash-agent',
         kind: 'slash',
         title: '/agent',
-        detail: 'Open the agent terminal workflow',
-        hint: 'open dock',
-        action: () => { setRightTab('agent'); setRightOpen(true) },
+        detail: t('command.agentDetail'),
+        hint: t('command.agentHint'),
+        action: () => { setBottomPanelMode('agent'); setLocalOpen(true) },
       },
       {
         id: 'slash-sessions',
         kind: 'slash',
         title: '/sessions',
-        detail: 'Open saved agent sessions for the current server',
-        hint: 'agent',
-        action: () => { setRightTab('agent'); setRightOpen(true) },
+        detail: t('command.sessionsDetail'),
+        hint: t('command.agentHint'),
+        action: () => { setBottomPanelMode('agent'); setLocalOpen(true) },
       },
     ]
 
@@ -97,8 +107,9 @@ export function CommandPalette() {
       id: h.id,
       kind: 'history' as const,
       title: h.command,
-      detail: h.connectionName ? `Last used on ${h.connectionName}` : 'Recent command',
-      hint: 'insert later',
+      detail: h.connectionName ? t('command.historyItemDetail').replace('{name}', h.connectionName) : t('command.historyRecent'),
+      hint: t('command.run'),
+      command: h.command,
     }))
 
     const snippetItems = commandSnippets.map(snippet => ({
@@ -107,6 +118,7 @@ export function CommandPalette() {
       title: `/snp-${snippet.name}`,
       detail: snippet.command,
       hint: `/snippets-${snippet.name}`,
+      command: snippet.command,
     }))
 
     const needle = query.trim().replace(/^\//, '').toLowerCase()
@@ -117,12 +129,14 @@ export function CommandPalette() {
       item.detail.toLowerCase().includes(needle) ||
       item.hint.toLowerCase().includes(needle)
     )
-  }, [commandHistory, commandSnippets, query, openConnectDialog, setRightOpen, setRightTab, toggleLocal])
+  }, [commandHistory, commandSnippets, query, openConnectDialog, setBottomPanelMode, setLocalOpen, setRightOpen, setRightTab, t, toggleLocal])
 
   useEffect(() => {
     if (!commandPaletteOpen) return
-    setQuery('/')
+    setQuery('')
     setSelected(0)
+    setEditorDraft(null)
+    setErr('')
     requestAnimationFrame(() => inputRef.current?.focus())
   }, [commandPaletteOpen])
 
@@ -132,9 +146,22 @@ export function CommandPalette() {
 
   if (!commandPaletteOpen) return null
 
-  const run = (item?: CommandItem) => {
-    item?.action?.()
-    setCommandPaletteOpen(false)
+  const run = async (item?: CommandItem, mode: 'insert' | 'run' = 'insert') => {
+    setErr('')
+    if (item) {
+      try {
+        if (item.command != null) {
+          await sendCommandToActiveTerminal(item.command, mode)
+        } else {
+          await item.action?.()
+        }
+        if (item.id !== 'slash-edit') setCommandPaletteOpen(false)
+      } catch (err) {
+        setErr(String(err))
+      }
+      return
+    }
+    setEditorDraft(queryToCommand(query))
   }
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -153,9 +180,14 @@ export function CommandPalette() {
       setSelected(v => Math.max(0, v - 1))
       return
     }
+    if (e.key === 'Enter' && e.shiftKey) {
+      e.preventDefault()
+      setEditorDraft(queryToCommand(query))
+      return
+    }
     if (e.key === 'Enter') {
       e.preventDefault()
-      run(items[selected])
+      run(items[selected], 'run').catch(err => setErr(String(err)))
     }
   }
 
@@ -171,23 +203,24 @@ export function CommandPalette() {
             onKeyDown={onKeyDown}
             style={s.input}
             spellCheck={false}
-            placeholder="/ command, history, snippet"
+            placeholder={t('command.placeholder')}
           />
           <span style={s.keyHint}>Esc</span>
         </div>
+        {err && <div style={s.error}>{err}</div>}
 
         <div style={s.list}>
           {items.length === 0 ? (
-            <div style={s.empty}>No command matches.</div>
+            <div style={s.empty}>{t('command.empty')}</div>
           ) : items.slice(0, 8).map((item, index) => (
             <button
               key={item.id}
               type="button"
               style={{ ...s.item, ...(index === selected ? s.itemOn : {}) }}
               onMouseEnter={() => setSelected(index)}
-              onClick={() => run(item)}
+              onClick={() => run(item, 'insert').catch(err => setErr(String(err)))}
             >
-              <span style={s.kind}>{kindLabel[item.kind]}</span>
+              <span style={s.kind}>{commandKindLabel(item.kind, t)}</span>
               <span style={s.itemMain}>
                 <span style={s.title}>{item.title}</span>
                 <span style={s.detail}>{item.detail}</span>
@@ -196,9 +229,100 @@ export function CommandPalette() {
             </button>
           ))}
         </div>
+        <div style={s.footer}>
+          <span>{t('command.enterHint')}</span>
+          <button style={s.footerBtn} onClick={() => setEditorDraft(queryToCommand(query))}>{t('command.longCommand')}</button>
+        </div>
+      </div>
+      {editorDraft != null && (
+        <LongCommandEditor
+          value={editorDraft}
+          onChange={setEditorDraft}
+          onClose={() => setEditorDraft(null)}
+          onInsert={async value => {
+            await sendCommandToActiveTerminal(value, 'insert')
+            setCommandPaletteOpen(false)
+          }}
+          onRun={async value => {
+            await sendCommandToActiveTerminal(value, 'run')
+            setCommandPaletteOpen(false)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+function LongCommandEditor({
+  value,
+  onChange,
+  onClose,
+  onInsert,
+  onRun,
+}: {
+  value: string
+  onChange: (value: string) => void
+  onClose: () => void
+  onInsert: (value: string) => Promise<void>
+  onRun: (value: string) => Promise<void>
+}) {
+  const { t } = useI18n()
+  const textRef = useRef<HTMLTextAreaElement>(null)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    requestAnimationFrame(() => textRef.current?.focus())
+  }, [])
+
+  const submit = async (mode: 'insert' | 'run') => {
+    setErr('')
+    try {
+      if (mode === 'insert') await onInsert(value)
+      else await onRun(value)
+    } catch (err) {
+      setErr(String(err))
+    }
+  }
+
+  return (
+    <div style={s.editorOverlay} onMouseDown={onClose}>
+      <div style={s.editor} onMouseDown={e => e.stopPropagation()}>
+        <div style={s.editorTitle}>{t('command.longCommand')}</div>
+        <textarea
+          ref={textRef}
+          style={s.editorText}
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Escape') onClose()
+            if (e.key === 'Enter' && e.ctrlKey) {
+              e.preventDefault()
+              submit('run')
+            }
+          }}
+          spellCheck={false}
+          placeholder={t('command.longPlaceholder')}
+        />
+        {err && <div style={s.error}>{err}</div>}
+        <div style={s.editorActions}>
+          <button style={s.footerBtn} onClick={onClose}>{t('general.cancel')}</button>
+          <button style={s.footerBtn} onClick={() => submit('insert')}>{t('command.insert')}</button>
+          <button style={s.primaryBtn} onClick={() => submit('run')}>{t('command.run')}</button>
+        </div>
       </div>
     </div>
   )
+}
+
+function queryToCommand(query: string) {
+  const trimmed = query.trim()
+  return trimmed === '/edit' ? '' : trimmed
+}
+
+function commandKindLabel(kind: CommandKind, t: (key: I18nKey) => string) {
+  if (kind === 'history') return t('command.history')
+  if (kind === 'snippet') return t('command.snippet')
+  return t('command.command')
 }
 
 const s: Record<string, React.CSSProperties> = {
@@ -214,8 +338,8 @@ const s: Record<string, React.CSSProperties> = {
   },
   panel: {
     width:'min(680px, calc(100vw - 36px))',
-    background:'#1e1e1e',
-    border:'1px solid rgba(255,255,255,0.09)',
+    background:'var(--c0)',
+    border:'1px solid var(--b1)',
     boxShadow:'0 18px 44px rgba(0,0,0,0.42)',
     borderRadius:6,
     overflow:'hidden',
@@ -227,10 +351,10 @@ const s: Record<string, React.CSSProperties> = {
     alignItems:'center',
     gap:8,
     padding:'0 10px',
-    borderBottom:'1px solid rgba(255,255,255,0.06)',
-    background:'#252526',
+    borderBottom:'1px solid var(--b0)',
+    background:'var(--c1)',
   },
-  prompt: { color:'#569cd6', fontSize:13, width:14, textAlign:'center' },
+  prompt: { color:'var(--acc)', fontSize:'var(--ui-font-lg)', width:14, textAlign:'center' },
   input: {
     flex:1,
     minWidth:0,
@@ -238,14 +362,14 @@ const s: Record<string, React.CSSProperties> = {
     border:'none',
     outline:'none',
     background:'transparent',
-    color:'#d4d4d4',
+    color:'var(--t0)',
     fontFamily:'var(--fm)',
-    fontSize:12,
+    fontSize:'var(--ui-font-md)',
   },
   keyHint: {
-    fontSize:10,
-    color:'#686868',
-    border:'1px solid rgba(255,255,255,0.08)',
+    fontSize:'var(--ui-font-sm)',
+    color:'var(--t2)',
+    border:'1px solid var(--b1)',
     borderRadius:3,
     padding:'2px 5px',
   },
@@ -259,18 +383,18 @@ const s: Record<string, React.CSSProperties> = {
     border:'none',
     borderRadius:4,
     background:'transparent',
-    color:'#d4d4d4',
+    color:'var(--t0)',
     cursor:'pointer',
     padding:'0 8px',
     textAlign:'left',
     fontFamily:'var(--fm)',
   },
-  itemOn: { background:'#2d2d2d' },
+  itemOn: { background:'var(--c2)' },
   kind: {
     width:54,
     flexShrink:0,
-    color:'#686868',
-    fontSize:10,
+    color:'var(--t2)',
+    fontSize:'var(--ui-font-sm)',
     textTransform:'uppercase',
   },
   itemMain: {
@@ -281,31 +405,40 @@ const s: Record<string, React.CSSProperties> = {
     gap:2,
   },
   title: {
-    color:'#d4d4d4',
-    fontSize:12,
+    color:'var(--t0)',
+    fontSize:'var(--ui-font-md)',
     overflow:'hidden',
     textOverflow:'ellipsis',
     whiteSpace:'nowrap',
   },
   detail: {
-    color:'#686868',
-    fontSize:10,
+    color:'var(--t2)',
+    fontSize:'var(--ui-font-sm)',
     overflow:'hidden',
     textOverflow:'ellipsis',
     whiteSpace:'nowrap',
   },
   hint: {
     maxWidth:120,
-    color:'#454545',
-    fontSize:10,
+    color:'var(--t3)',
+    fontSize:'var(--ui-font-sm)',
     overflow:'hidden',
     textOverflow:'ellipsis',
     whiteSpace:'nowrap',
   },
   empty: {
     padding:'18px 10px',
-    color:'#686868',
-    fontSize:11,
+    color:'var(--t2)',
+    fontSize:'var(--ui-font)',
     textAlign:'center',
   },
+  footer: { minHeight:30, display:'flex', alignItems:'center', justifyContent:'space-between', borderTop:'1px solid var(--b0)', padding:'0 10px', color:'var(--t2)', fontSize:'var(--ui-font-sm)' },
+  footerBtn: { height:24, border:'1px solid var(--b1)', borderRadius:3, background:'var(--c1)', color:'var(--t0)', cursor:'pointer', fontFamily:'var(--fm)', fontSize:'var(--ui-font-sm)', padding:'0 8px' },
+  primaryBtn: { height:24, border:'none', borderRadius:3, background:'var(--acc)', color:'#0b1b24', cursor:'pointer', fontFamily:'var(--fm)', fontSize:'var(--ui-font-sm)', padding:'0 10px' },
+  error: { color:'var(--red)', fontSize:'var(--ui-font-sm)', padding:'6px 10px' },
+  editorOverlay: { position:'fixed', inset:0, zIndex:21, display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,0.28)', padding:18 },
+  editor: { width:'min(760px, calc(100vw - 36px))', border:'1px solid var(--b2)', borderRadius:6, background:'var(--c0)', boxShadow:'0 18px 44px rgba(0,0,0,0.42)', padding:12, display:'flex', flexDirection:'column', gap:10, fontFamily:'var(--fm)' },
+  editorTitle: { color:'var(--t0)', fontSize:'var(--ui-font-md)', fontWeight:700 },
+  editorText: { minHeight:180, resize:'vertical', border:'1px solid var(--b1)', borderRadius:4, background:'var(--c1)', color:'var(--t0)', outline:'none', padding:10, fontFamily:'var(--fm)', fontSize:'var(--ui-font-md)', lineHeight:1.55 },
+  editorActions: { display:'flex', justifyContent:'flex-end', gap:8 },
 }

@@ -18,9 +18,58 @@
   --red:#f44747;
   --grn:#4ec9b0;
   --r:3px;
+  --ui-font:11px;
+  --ui-font-sm:10px;
+  --ui-font-md:12px;
+  --ui-font-lg:13px;
+}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --c0:#f3f3f3;
+  --c1:#ffffff;
+  --c2:#ededed;
+  --c3:#dedede;
+  --c4:#c8c8c8;
+  --b0:rgba(0,0,0,0.05);
+  --b1:rgba(0,0,0,0.09);
+  --b2:rgba(0,0,0,0.15);
+  --t0:#1f2328;
+  --t1:#4d5560;
+  --t2:#6e7781;
+  --t3:#8c959f;
+}
+:root[data-ui-font-size="medium"]{
+  --ui-font:12px;
+  --ui-font-sm:11px;
+  --ui-font-md:13px;
+  --ui-font-lg:14px;
+}
+:root[data-ui-font-size="large"]{
+  --ui-font:13px;
+  --ui-font-sm:12px;
+  --ui-font-md:14px;
+  --ui-font-lg:15px;
 }
 html,body,#root{width:100%;height:100%;overflow:hidden;background:var(--c0);font-family:var(--fm)}
-button{font-family:inherit}
+html[data-theme="light"] #root input::placeholder,
+html[data-theme="light"] #root textarea::placeholder{
+  color:var(--t3)!important;
+}
+html[data-theme="light"] #root button:disabled,
+html[data-theme="light"] #root input:disabled{
+  color:var(--t3)!important;
+}
+body{font-size:var(--ui-font)}
+button,input,select,textarea{font-family:inherit;font-size:var(--ui-font)}
+
+.window-control:hover{
+  background:var(--c2)!important;
+  color:var(--t0)!important;
+}
+.window-control-close:hover{
+  background:#c42b1c!important;
+  color:#fff!important;
+}
 
 *{scrollbar-width:thin;scrollbar-color:#6a6a6a transparent}
 *::-webkit-scrollbar{width:10px;height:10px}

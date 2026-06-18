@@ -1,22 +1,44 @@
-use crate::{
-    db::Db,
-    ssh::{SessionStore, SshConnectionInfo},
-};
+use crate::ssh::{SessionStore, SshSharedHandle};
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{Read, Write},
-    net::TcpStream,
     path::Path,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 pub type FileJobStore = Arc<Mutex<HashMap<String, FileJob>>>;
+pub type SftpTransferLimiter = Arc<Semaphore>;
+pub const SFTP_MAX_CONCURRENT_TRANSFERS: usize = 3;
+const RUSSH_SFTP_OPEN_TIMEOUT_SECS: u64 = 15;
+
+#[derive(Clone)]
+enum SftpAccess {
+    Russh {
+        handle: SshSharedHandle,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum UploadConflictPolicy {
+    Overwrite,
+    Skip,
+    Fail,
+}
+
+impl UploadConflictPolicy {
+    fn from_input(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("skip") => Self::Skip,
+            Some("fail") => Self::Fail,
+            _ => Self::Overwrite,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +54,7 @@ pub struct FileJob {
     pub message: Option<String>,
     pub entries: Option<Vec<RemoteFileEntry>>,
     pub content: Option<String>,
+    pub failed_entries: Option<Vec<FileJobFailure>>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -45,6 +68,14 @@ pub struct RemoteFileEntry {
     pub size: Option<u64>,
     pub modified_at: Option<u64>,
     pub permissions: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileJobFailure {
+    pub local_path: String,
+    pub remote_path: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -90,10 +121,9 @@ pub async fn file_queue_list_dir(
     path: String,
     jobs: State<'_, FileJobStore>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -111,6 +141,7 @@ pub async fn file_queue_list_dir(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -144,10 +175,9 @@ pub async fn file_queue_list_dir(
             return;
         }
 
-        let result =
-            tokio::task::spawn_blocking(move || list_dir_blocking(connection, &list_path)).await;
+        let result = list_dir(access, &list_path).await;
         match result {
-            Ok(Ok(entries)) => {
+            Ok(entries) => {
                 update_job_with_entries(
                     &store,
                     &app2,
@@ -159,19 +189,8 @@ pub async fn file_queue_list_dir(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -186,10 +205,9 @@ pub async fn file_queue_preview(
     path: String,
     jobs: State<'_, FileJobStore>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -203,6 +221,7 @@ pub async fn file_queue_preview(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -224,11 +243,9 @@ pub async fn file_queue_preview(
             "Reading remote file",
         )
         .await;
-        let result =
-            tokio::task::spawn_blocking(move || preview_file_blocking(connection, &preview_path))
-                .await;
+        let result = preview_file(access, &preview_path).await;
         match result {
-            Ok(Ok(content)) => {
+            Ok(content) => {
                 update_job_content(
                     &store,
                     &app2,
@@ -240,19 +257,8 @@ pub async fn file_queue_preview(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -267,11 +273,11 @@ pub async fn file_queue_download(
     remote_path: String,
     local_path: String,
     jobs: State<'_, FileJobStore>,
+    transfer_limiter: State<'_, SftpTransferLimiter>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -285,6 +291,7 @@ pub async fn file_queue_download(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -297,7 +304,29 @@ pub async fn file_queue_download(
     let job_id = job.id.clone();
     let remote_path = job.path.clone();
     let local_path = job.local_path.clone().unwrap_or_default();
+    let limiter = transfer_limiter.inner().clone();
     tokio::spawn(async move {
+        update_job(
+            &store,
+            &app2,
+            &job_id,
+            FileJobStatus::Running,
+            5,
+            "Waiting for SFTP transfer slot",
+        )
+        .await;
+        let Ok(_permit) = limiter.acquire_owned().await else {
+            update_job(
+                &store,
+                &app2,
+                &job_id,
+                FileJobStatus::Failed,
+                100,
+                "SFTP transfer limiter closed",
+            )
+            .await;
+            return;
+        };
         update_job(
             &store,
             &app2,
@@ -307,12 +336,13 @@ pub async fn file_queue_download(
             "Downloading remote file",
         )
         .await;
-        let result = tokio::task::spawn_blocking(move || {
-            download_file_blocking(connection, &remote_path, &local_path)
-        })
-        .await;
+        if is_job_canceled(&store, &job_id).await {
+            return;
+        }
+        let result =
+            download_file_tracked(access, &remote_path, &local_path, &store, &app2, &job_id).await;
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 update_job(
                     &store,
                     &app2,
@@ -323,19 +353,8 @@ pub async fn file_queue_download(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -349,12 +368,13 @@ pub async fn file_queue_upload(
     session_id: Option<String>,
     local_path: String,
     remote_path: String,
+    conflict_policy: Option<String>,
     jobs: State<'_, FileJobStore>,
+    transfer_limiter: State<'_, SftpTransferLimiter>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -368,6 +388,7 @@ pub async fn file_queue_upload(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -380,7 +401,30 @@ pub async fn file_queue_upload(
     let job_id = job.id.clone();
     let remote_path = job.path.clone();
     let local_path = job.local_path.clone().unwrap_or_default();
+    let conflict_policy = UploadConflictPolicy::from_input(conflict_policy);
+    let limiter = transfer_limiter.inner().clone();
     tokio::spawn(async move {
+        update_job(
+            &store,
+            &app2,
+            &job_id,
+            FileJobStatus::Running,
+            5,
+            "Waiting for SFTP transfer slot",
+        )
+        .await;
+        let Ok(_permit) = limiter.acquire_owned().await else {
+            update_job(
+                &store,
+                &app2,
+                &job_id,
+                FileJobStatus::Failed,
+                100,
+                "SFTP transfer limiter closed",
+            )
+            .await;
+            return;
+        };
         update_job(
             &store,
             &app2,
@@ -390,12 +434,13 @@ pub async fn file_queue_upload(
             "Uploading local file",
         )
         .await;
-        let result = tokio::task::spawn_blocking(move || {
-            upload_file_blocking(connection, &local_path, &remote_path)
-        })
-        .await;
+        if is_job_canceled(&store, &job_id).await {
+            return;
+        }
+        let result =
+            upload_file_tracked(access, &local_path, &remote_path, conflict_policy, &store, &app2, &job_id).await;
         match result {
-            Ok(Ok(())) => {
+            Ok(failures) if failures.is_empty() => {
                 update_job(
                     &store,
                     &app2,
@@ -406,19 +451,31 @@ pub async fn file_queue_upload(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
-            Err(err) => {
-                update_job(
+            Ok(failures) => {
+                let sample = failures
+                    .iter()
+                    .take(3)
+                    .map(|failure| format!("{}: {}", failure.local_path, failure.message))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let message = format!(
+                    "Folder upload completed with {} failed entries: {}",
+                    failures.len(),
+                    sample
+                );
+                update_job_with_failures(
                     &store,
                     &app2,
                     &job_id,
                     FileJobStatus::Failed,
                     100,
-                    &err.to_string(),
+                    &message,
+                    failures,
                 )
                 .await;
+            }
+            Err(err) => {
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -434,10 +491,9 @@ pub async fn file_queue_delete(
     is_dir: bool,
     jobs: State<'_, FileJobStore>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -451,6 +507,7 @@ pub async fn file_queue_delete(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -472,11 +529,9 @@ pub async fn file_queue_delete(
             "Deleting remote entry",
         )
         .await;
-        let result =
-            tokio::task::spawn_blocking(move || delete_blocking(connection, &delete_path, is_dir))
-                .await;
+        let result = delete_entry(access, &delete_path, is_dir).await;
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 update_job(
                     &store,
                     &app2,
@@ -487,19 +542,8 @@ pub async fn file_queue_delete(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -515,10 +559,9 @@ pub async fn file_queue_rename(
     target_path: String,
     jobs: State<'_, FileJobStore>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -532,6 +575,7 @@ pub async fn file_queue_rename(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -554,11 +598,9 @@ pub async fn file_queue_rename(
             "Renaming remote entry",
         )
         .await;
-        let result =
-            tokio::task::spawn_blocking(move || rename_blocking(connection, &path, &target_path))
-                .await;
+        let result = rename_entry(access, &path, &target_path).await;
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 update_job(
                     &store,
                     &app2,
@@ -569,19 +611,8 @@ pub async fn file_queue_rename(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -596,10 +627,9 @@ pub async fn file_queue_mkdir(
     path: String,
     jobs: State<'_, FileJobStore>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -613,6 +643,7 @@ pub async fn file_queue_mkdir(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -634,10 +665,9 @@ pub async fn file_queue_mkdir(
             "Creating remote folder",
         )
         .await;
-        let result =
-            tokio::task::spawn_blocking(move || mkdir_blocking(connection, &mkdir_path)).await;
+        let result = mkdir_entry(access, &mkdir_path).await;
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 update_job(
                     &store,
                     &app2,
@@ -648,19 +678,8 @@ pub async fn file_queue_mkdir(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -675,10 +694,9 @@ pub async fn file_queue_create_file(
     path: String,
     jobs: State<'_, FileJobStore>,
     sessions: State<'_, SessionStore>,
-    db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<FileJob, String> {
-    let connection = resolve_connection(&device_id, session_id.as_deref(), &sessions, &db).await?;
+    let access = resolve_access(session_id.as_deref(), &sessions).await?;
     let now = now_ms();
     let job = FileJob {
         id: Uuid::new_v4().to_string(),
@@ -692,6 +710,7 @@ pub async fn file_queue_create_file(
         message: Some("Queued in background worker".into()),
         entries: None,
         content: None,
+        failed_entries: None,
         created_at: now,
         updated_at: now,
     };
@@ -713,10 +732,9 @@ pub async fn file_queue_create_file(
             "Creating remote file",
         )
         .await;
-        let result =
-            tokio::task::spawn_blocking(move || create_file_blocking(connection, &file_path)).await;
+        let result = create_file_entry(access, &file_path).await;
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 update_job(
                     &store,
                     &app2,
@@ -727,19 +745,8 @@ pub async fn file_queue_create_file(
                 )
                 .await;
             }
-            Ok(Err(err)) => {
-                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
-            }
             Err(err) => {
-                update_job(
-                    &store,
-                    &app2,
-                    &job_id,
-                    FileJobStatus::Failed,
-                    100,
-                    &err.to_string(),
-                )
-                .await;
+                update_job(&store, &app2, &job_id, FileJobStatus::Failed, 100, &err).await;
             }
         }
     });
@@ -783,6 +790,7 @@ pub async fn file_cancel_job(
     job.message = Some("Canceled".into());
     job.entries = None;
     job.content = None;
+    job.failed_entries = None;
     job.updated_at = now_ms();
     let job = job.clone();
     drop(guard);
@@ -810,10 +818,30 @@ async fn update_job(
     job.message = Some(message.into());
     job.entries = None;
     job.content = None;
+    job.failed_entries = None;
     job.updated_at = now_ms();
     let job = job.clone();
     drop(guard);
     emit_job(app, &job);
+}
+
+async fn is_job_canceled(store: &FileJobStore, job_id: &str) -> bool {
+    store
+        .lock()
+        .await
+        .get(job_id)
+        .map(|job| job.status == FileJobStatus::Canceled)
+        .unwrap_or(true)
+}
+
+fn transfer_progress(base: u8, transferred: u64, total: u64) -> u8 {
+    if total == 0 {
+        return base;
+    }
+    let span = 99u64.saturating_sub(base as u64);
+    (base as u64 + transferred.saturating_mul(span) / total)
+        .min(99)
+        .max(base as u64) as u8
 }
 
 async fn update_job_with_entries(
@@ -837,6 +865,7 @@ async fn update_job_with_entries(
     job.message = Some(message.into());
     job.entries = entries;
     job.content = None;
+    job.failed_entries = None;
     job.updated_at = now_ms();
     let job = job.clone();
     drop(guard);
@@ -864,63 +893,170 @@ async fn update_job_content(
     job.message = Some(message.into());
     job.entries = None;
     job.content = content;
+    job.failed_entries = None;
     job.updated_at = now_ms();
     let job = job.clone();
     drop(guard);
     emit_job(app, &job);
 }
 
-async fn resolve_connection(
-    device_id: &str,
+async fn update_job_with_failures(
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
+    status: FileJobStatus,
+    progress: u8,
+    message: &str,
+    failures: Vec<FileJobFailure>,
+) {
+    let mut guard = store.lock().await;
+    let Some(job) = guard.get_mut(job_id) else {
+        return;
+    };
+    if job.status == FileJobStatus::Canceled {
+        return;
+    }
+    job.status = status;
+    job.progress = progress;
+    job.message = Some(message.into());
+    job.entries = None;
+    job.content = None;
+    job.failed_entries = Some(failures);
+    job.updated_at = now_ms();
+    let job = job.clone();
+    drop(guard);
+    emit_job(app, &job);
+}
+
+async fn resolve_access(
     session_id: Option<&str>,
     sessions: &State<'_, SessionStore>,
-    db: &State<'_, Db>,
-) -> Result<SshConnectionInfo, String> {
+) -> Result<SftpAccess, String> {
     if let Some(session_id) = session_id {
         if let Some(session) = sessions.lock().await.get(session_id) {
-            return Ok(session.connection.clone());
+            return Ok(SftpAccess::Russh {
+                handle: session.handle.clone(),
+            });
         }
     }
 
-    let device = db.device(device_id)?;
-    if !device.remember_password {
-        return Err("Remote files need an active session or a remembered password".into());
-    }
-    let password = db.device_password(device_id, Some(&device))?.ok_or_else(|| {
-        "Saved password is missing. Reconnect this device once with remember password enabled."
-            .to_string()
-    })?;
-    Ok(SshConnectionInfo {
-        host: device.host,
-        port: device.port,
-        username: device.username,
-        password,
-    })
+    Err("Remote files require an active SSH session. Connect the device first.".into())
 }
 
-fn list_dir_blocking(
-    connection: SshConnectionInfo,
+async fn list_dir(access: SftpAccess, path: &str) -> Result<Vec<RemoteFileEntry>, String> {
+    match access {
+        SftpAccess::Russh { handle } => list_dir_russh(handle, path).await,
+    }
+}
+
+async fn preview_file(access: SftpAccess, path: &str) -> Result<String, String> {
+    match access {
+        SftpAccess::Russh { handle } => preview_file_russh(handle, path).await,
+    }
+}
+
+async fn download_file_tracked(
+    access: SftpAccess,
+    remote_path: &str,
+    local_path: &str,
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
+) -> Result<(), String> {
+    match access {
+        SftpAccess::Russh { handle } => {
+            download_file_russh_tracked(handle, remote_path, local_path, store, app, job_id).await
+        }
+    }
+}
+
+async fn upload_file_tracked(
+    access: SftpAccess,
+    local_path: &str,
+    remote_path: &str,
+    conflict_policy: UploadConflictPolicy,
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
+) -> Result<Vec<FileJobFailure>, String> {
+    match access {
+        SftpAccess::Russh { handle } => {
+            upload_file_russh_tracked(handle, local_path, remote_path, conflict_policy, store, app, job_id).await
+        }
+    }
+}
+
+async fn delete_entry(access: SftpAccess, path: &str, is_dir: bool) -> Result<(), String> {
+    match access {
+        SftpAccess::Russh { handle } => delete_russh(handle, path, is_dir).await,
+    }
+}
+
+async fn rename_entry(access: SftpAccess, path: &str, target_path: &str) -> Result<(), String> {
+    match access {
+        SftpAccess::Russh { handle } => rename_russh(handle, path, target_path).await,
+    }
+}
+
+async fn mkdir_entry(access: SftpAccess, path: &str) -> Result<(), String> {
+    match access {
+        SftpAccess::Russh { handle } => mkdir_russh(handle, path).await,
+    }
+}
+
+async fn create_file_entry(access: SftpAccess, path: &str) -> Result<(), String> {
+    match access {
+        SftpAccess::Russh { handle } => create_file_russh(handle, path).await,
+    }
+}
+
+async fn open_russh_sftp(
+    handle: SshSharedHandle,
+) -> Result<russh_sftp::client::SftpSession, String> {
+    tokio::time::timeout(Duration::from_secs(RUSSH_SFTP_OPEN_TIMEOUT_SECS), async {
+        let channel = {
+            let h = handle.lock().await;
+            h.channel_open_session()
+                .await
+                .map_err(|e| format!("failed to open SFTP channel: {e}"))?
+        };
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| format!("failed to start SFTP subsystem: {e}"))?;
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| format!("failed to initialize SFTP: {e}"))?;
+        sftp.set_timeout(RUSSH_SFTP_OPEN_TIMEOUT_SECS);
+        Ok(sftp)
+    })
+    .await
+    .map_err(|_| format!("SFTP subsystem timed out after {RUSSH_SFTP_OPEN_TIMEOUT_SECS}s"))?
+}
+
+async fn list_dir_russh(
+    handle: SshSharedHandle,
     path: &str,
 ) -> Result<Vec<RemoteFileEntry>, String> {
-    let (_session, sftp) = connect_sftp(connection)?;
-    let mut entries: Vec<RemoteFileEntry> = sftp
-        .readdir(Path::new(path))
-        .map_err(|e| format!("failed to read directory: {e}"))?
-        .into_iter()
-        .filter_map(|(entry_path, stat)| {
-            let name = entry_path.file_name()?.to_string_lossy().to_string();
-            if name == "." || name == ".." {
-                return None;
-            }
-            Some(RemoteFileEntry {
+    let sftp = open_russh_sftp(handle).await?;
+    let entries = sftp
+        .read_dir(path)
+        .await
+        .map_err(|e| format!("failed to read directory: {e}"))?;
+    let mut entries: Vec<RemoteFileEntry> = entries
+        .map(|entry| {
+            let name = entry.file_name();
+            let meta = entry.metadata();
+            RemoteFileEntry {
+                path: join_remote_path(path, &name),
                 name,
-                path: entry_path.to_string_lossy().replace('\\', "/"),
-                is_dir: stat.is_dir(),
-                size: stat.size,
-                modified_at: stat.mtime,
-                permissions: stat.perm,
-            })
+                is_dir: entry.file_type().is_dir(),
+                size: meta.size,
+                modified_at: meta.mtime.map(u64::from),
+                permissions: meta.permissions,
+            }
         })
+        .filter(|entry| entry.name != "." && entry.name != "..")
         .collect();
     entries.sort_by(|a, b| {
         b.is_dir
@@ -930,146 +1066,632 @@ fn list_dir_blocking(
     Ok(entries)
 }
 
-fn preview_file_blocking(connection: SshConnectionInfo, path: &str) -> Result<String, String> {
+async fn preview_file_russh(handle: SshSharedHandle, path: &str) -> Result<String, String> {
     const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
-    let (_session, sftp) = connect_sftp(connection)?;
-    let stat = sftp
-        .stat(Path::new(path))
+    let sftp = open_russh_sftp(handle).await?;
+    let meta = sftp
+        .metadata(path)
+        .await
         .map_err(|e| format!("failed to stat remote file: {e}"))?;
-    if stat.is_dir() {
+    if meta.is_dir() {
         return Err("Cannot preview a directory".into());
     }
-    if stat.size.unwrap_or(0) > MAX_PREVIEW_BYTES {
+    if meta.size.unwrap_or(0) > MAX_PREVIEW_BYTES {
         return Err("File is too large for preview".into());
     }
 
-    let mut remote = sftp
-        .open(Path::new(path))
-        .map_err(|e| format!("failed to open remote file: {e}"))?;
-    let mut buf = Vec::new();
-    remote
-        .read_to_end(&mut buf)
+    let buf = sftp
+        .read(path)
+        .await
         .map_err(|e| format!("failed to read remote file: {e}"))?;
+    if buf.len() as u64 > MAX_PREVIEW_BYTES {
+        return Err("File is too large for preview".into());
+    }
     if buf.iter().any(|byte| *byte == 0) {
         return Err("Binary files cannot be previewed yet".into());
     }
     String::from_utf8(buf).map_err(|_| "File is not valid UTF-8 text".to_string())
 }
 
-fn download_file_blocking(
-    connection: SshConnectionInfo,
+async fn download_file_russh_tracked(
+    handle: SshSharedHandle,
     remote_path: &str,
     local_path: &str,
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
 ) -> Result<(), String> {
     if local_path.trim().is_empty() {
         return Err("Local path is required".into());
     }
-    let (_session, sftp) = connect_sftp(connection)?;
+    let sftp = open_russh_sftp(handle).await?;
+    let meta = sftp
+        .metadata(remote_path)
+        .await
+        .map_err(|e| format!("failed to stat remote file: {e}"))?;
+    if meta.is_dir() {
+        return download_dir_russh_tracked(
+            &sftp,
+            remote_path,
+            Path::new(local_path),
+            store,
+            app,
+            job_id,
+        )
+        .await;
+    }
+    let total = meta.size.unwrap_or(0);
     let mut remote = sftp
-        .open(Path::new(remote_path))
+        .open(remote_path)
+        .await
         .map_err(|e| format!("failed to open remote file: {e}"))?;
     let local = Path::new(local_path);
     if let Some(parent) = local.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| format!("failed to create local directory: {e}"))?;
         }
     }
-    let mut file = File::create(local).map_err(|e| format!("failed to create local file: {e}"))?;
-    std::io::copy(&mut remote, &mut file)
-        .map_err(|e| format!("failed to write local file: {e}"))?;
+
+    let file_name = local
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Invalid local path".to_string())?;
+    let tmp_path = local.with_file_name(format!("{file_name}.part"));
+    let result: Result<(), String> = async {
+        let mut file = tokio::fs::File::create(&tmp_path)
+            .await
+            .map_err(|e| format!("failed to create local file: {e}"))?;
+        let mut transferred = 0u64;
+        let mut last_progress = 15u8;
+        let mut buf = vec![0u8; 32768];
+        loop {
+            if is_job_canceled(store, job_id).await {
+                return Err("Canceled".into());
+            }
+            let n = remote
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("failed to read remote file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("failed to write local file: {e}"))?;
+            transferred += n as u64;
+            let progress = transfer_progress(15, transferred, total);
+            if progress > last_progress {
+                last_progress = progress;
+                let msg = if total > 0 {
+                    format!("Downloading remote file ({transferred}/{total} bytes)")
+                } else {
+                    format!("Downloading remote file ({transferred} bytes)")
+                };
+                update_job(store, app, job_id, FileJobStatus::Running, progress, &msg).await;
+            }
+        }
+        let _ = remote.shutdown().await;
+        file.shutdown()
+            .await
+            .map_err(|e| format!("failed to flush local file: {e}"))?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(local).await;
+            tokio::fs::rename(&tmp_path, local)
+                .await
+                .map_err(|e| format!("failed to finalize local file: {e}"))
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            Err(err)
+        }
+    }
+}
+
+async fn download_dir_russh_tracked(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_root: &str,
+    local_root: &Path,
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
+) -> Result<(), String> {
+    tokio::fs::create_dir_all(local_root)
+        .await
+        .map_err(|e| format!("failed to create local directory: {e}"))?;
+    let mut stack = vec![(
+        remote_root.trim_end_matches('/').to_string(),
+        local_root.to_path_buf(),
+    )];
+    let mut files_done = 0u64;
+    while let Some((remote_dir, local_dir)) = stack.pop() {
+        if is_job_canceled(store, job_id).await {
+            return Err("Canceled".into());
+        }
+        tokio::fs::create_dir_all(&local_dir)
+            .await
+            .map_err(|e| format!("failed to create local directory: {e}"))?;
+        let entries = sftp
+            .read_dir(&remote_dir)
+            .await
+            .map_err(|e| format!("failed to read remote directory: {e}"))?;
+        for entry in entries {
+            let name = entry.file_name();
+            let remote_path = join_remote_path(&remote_dir, &name);
+            let local_path = local_dir.join(&name);
+            if entry.file_type().is_dir() {
+                stack.push((remote_path, local_path));
+            } else {
+                download_one_file_russh(sftp, &remote_path, &local_path).await?;
+                files_done += 1;
+                update_job(
+                    store,
+                    app,
+                    job_id,
+                    FileJobStatus::Running,
+                    50,
+                    &format!("Downloading folder ({files_done} files)"),
+                )
+                .await;
+            }
+        }
+    }
     Ok(())
 }
 
-fn upload_file_blocking(
-    connection: SshConnectionInfo,
+async fn download_one_file_russh(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_path: &str,
+    local_path: &Path,
+) -> Result<(), String> {
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("failed to create local directory: {e}"))?;
+    }
+    let mut remote = sftp
+        .open(remote_path)
+        .await
+        .map_err(|e| format!("failed to open remote file: {e}"))?;
+    let file_name = local_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Invalid local path".to_string())?;
+    let tmp_path = local_path.with_file_name(format!("{file_name}.part"));
+    let result: Result<(), String> = async {
+        let mut file = tokio::fs::File::create(&tmp_path)
+            .await
+            .map_err(|e| format!("failed to create local file: {e}"))?;
+        let mut buf = vec![0u8; 32768];
+        loop {
+            let n = remote
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("failed to read remote file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("failed to write local file: {e}"))?;
+        }
+        let _ = remote.shutdown().await;
+        file.shutdown()
+            .await
+            .map_err(|e| format!("failed to flush local file: {e}"))?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(local_path).await;
+            tokio::fs::rename(&tmp_path, local_path)
+                .await
+                .map_err(|e| format!("failed to finalize local file: {e}"))
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            Err(err)
+        }
+    }
+}
+
+async fn upload_file_russh_tracked(
+    handle: SshSharedHandle,
     local_path: &str,
     remote_path: &str,
-) -> Result<(), String> {
+    conflict_policy: UploadConflictPolicy,
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
+) -> Result<Vec<FileJobFailure>, String> {
     if local_path.trim().is_empty() || remote_path.trim().is_empty() {
         return Err("Local path and remote path are required".into());
     }
-    let (_session, sftp) = connect_sftp(connection)?;
-    let mut file =
-        File::open(Path::new(local_path)).map_err(|e| format!("failed to open local file: {e}"))?;
+    let local_meta = tokio::fs::symlink_metadata(Path::new(local_path))
+        .await
+        .map_err(|e| format!("failed to stat local path: {e}"))?;
+    let sftp = open_russh_sftp(handle).await?;
+    if local_meta.is_dir() {
+        return upload_dir_russh_tracked(
+            &sftp,
+            Path::new(local_path),
+            remote_path,
+            conflict_policy,
+            store,
+            app,
+            job_id,
+        )
+        .await;
+    }
+    if local_meta.file_type().is_symlink() {
+        upload_symlink_russh(&sftp, Path::new(local_path), remote_path, conflict_policy).await?;
+        return Ok(Vec::new());
+    }
+    let total = local_meta.len();
+    let mut file = tokio::fs::File::open(Path::new(local_path))
+        .await
+        .map_err(|e| format!("failed to open local file: {e}"))?;
+    let tmp_remote_path = remote_part_path(remote_path);
+    match check_remote_conflict(&sftp, remote_path, conflict_policy).await? {
+        ConflictDecision::Proceed => {}
+        ConflictDecision::Skip => return Ok(Vec::new()),
+    }
     let mut remote = sftp
-        .create(Path::new(remote_path))
+        .create(&tmp_remote_path)
+        .await
         .map_err(|e| format!("failed to create remote file: {e}"))?;
-    std::io::copy(&mut file, &mut remote)
-        .map_err(|e| format!("failed to upload remote file: {e}"))?;
-    remote
-        .flush()
-        .map_err(|e| format!("failed to flush remote file: {e}"))?;
-    Ok(())
+
+    let result: Result<(), String> = async {
+        let mut transferred = 0u64;
+        let mut last_progress = 15u8;
+        let mut buf = vec![0u8; 32768];
+        loop {
+            if is_job_canceled(store, job_id).await {
+                let _ = remote.shutdown().await;
+                return Err("Canceled".into());
+            }
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("failed to read local file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            remote
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("failed to upload remote file: {e}"))?;
+            transferred += n as u64;
+            let progress = transfer_progress(15, transferred, total);
+            if progress > last_progress {
+                last_progress = progress;
+                let msg = if total > 0 {
+                    format!("Uploading local file ({transferred}/{total} bytes)")
+                } else {
+                    format!("Uploading local file ({transferred} bytes)")
+                };
+                update_job(store, app, job_id, FileJobStatus::Running, progress, &msg).await;
+            }
+        }
+        remote
+            .shutdown()
+            .await
+            .map_err(|e| format!("failed to flush remote file: {e}"))?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            let _ = sftp.remove_file(remote_path).await;
+            sftp.rename(&tmp_remote_path, remote_path)
+                .await
+                .map_err(|e| format!("failed to finalize remote file: {e}"))?;
+            preserve_remote_metadata(&sftp, remote_path, &local_meta).await;
+            Ok(Vec::new())
+        }
+        Err(err) => {
+            let _ = sftp.remove_file(&tmp_remote_path).await;
+            Err(err)
+        }
+    }
 }
 
-fn delete_blocking(connection: SshConnectionInfo, path: &str, is_dir: bool) -> Result<(), String> {
-    let (_session, sftp) = connect_sftp(connection)?;
+async fn upload_dir_russh_tracked(
+    sftp: &russh_sftp::client::SftpSession,
+    local_root: &Path,
+    remote_root: &str,
+    conflict_policy: UploadConflictPolicy,
+    store: &FileJobStore,
+    app: &AppHandle,
+    job_id: &str,
+) -> Result<Vec<FileJobFailure>, String> {
+    create_remote_dir_if_missing(sftp, remote_root).await?;
+    let mut stack = vec![(local_root.to_path_buf(), remote_root.trim_end_matches('/').to_string())];
+    let mut files_done = 0u64;
+    let mut failures = Vec::new();
+    while let Some((local_dir, remote_dir)) = stack.pop() {
+        if is_job_canceled(store, job_id).await {
+            return Err("Canceled".into());
+        }
+        let mut entries = tokio::fs::read_dir(&local_dir)
+            .await
+            .map_err(|e| format!("failed to read local directory {}: {e}", local_dir.display()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("failed to read local directory entry: {e}"))?
+        {
+            let local_path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let remote_path = join_remote_path(&remote_dir, &name);
+            let meta = tokio::fs::symlink_metadata(&local_path)
+                .await
+                .map_err(|e| format!("failed to stat local path {}: {e}", local_path.display()))?;
+            let result = if meta.is_dir() {
+                create_remote_dir_if_missing(sftp, &remote_path).await?;
+                preserve_remote_metadata(sftp, &remote_path, &meta).await;
+                stack.push((local_path.clone(), remote_path.clone()));
+                Ok(())
+            } else if meta.file_type().is_symlink() {
+                upload_symlink_russh(sftp, &local_path, &remote_path, conflict_policy).await
+            } else {
+                upload_one_file_russh(sftp, &local_path, &remote_path, &meta, conflict_policy).await
+            };
+            if let Err(err) = result {
+                failures.push(FileJobFailure {
+                    local_path: local_path.display().to_string(),
+                    remote_path: remote_path.clone(),
+                    message: err,
+                });
+            } else if !meta.is_dir() {
+                files_done += 1;
+                update_job(
+                    store,
+                    app,
+                    job_id,
+                    FileJobStatus::Running,
+                    50,
+                    &format!("Uploading folder ({files_done} entries)"),
+                )
+                .await;
+            }
+        }
+    }
+    Ok(failures)
+}
+
+async fn upload_one_file_russh(
+    sftp: &russh_sftp::client::SftpSession,
+    local_path: &Path,
+    remote_path: &str,
+    meta: &std::fs::Metadata,
+    conflict_policy: UploadConflictPolicy,
+) -> Result<(), String> {
+    match check_remote_conflict(sftp, remote_path, conflict_policy).await? {
+        ConflictDecision::Proceed => {}
+        ConflictDecision::Skip => return Ok(()),
+    }
+    let mut file = tokio::fs::File::open(local_path)
+        .await
+        .map_err(|e| format!("failed to open local file: {e}"))?;
+    let tmp_remote_path = remote_part_path(remote_path);
+    let mut remote = sftp
+        .create(&tmp_remote_path)
+        .await
+        .map_err(|e| format!("failed to create remote file: {e}"))?;
+    let result: Result<(), String> = async {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("failed to read local file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            remote
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| format!("failed to upload remote file: {e}"))?;
+        }
+        remote
+            .shutdown()
+            .await
+            .map_err(|e| format!("failed to flush remote file: {e}"))?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            let _ = sftp.remove_file(remote_path).await;
+            sftp.rename(&tmp_remote_path, remote_path)
+                .await
+                .map_err(|e| format!("failed to finalize remote file: {e}"))?;
+            preserve_remote_metadata(sftp, remote_path, meta).await;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = sftp.remove_file(&tmp_remote_path).await;
+            Err(err)
+        }
+    }
+}
+
+async fn upload_symlink_russh(
+    sftp: &russh_sftp::client::SftpSession,
+    local_path: &Path,
+    remote_path: &str,
+    conflict_policy: UploadConflictPolicy,
+) -> Result<(), String> {
+    match check_remote_conflict(sftp, remote_path, conflict_policy).await? {
+        ConflictDecision::Proceed => {}
+        ConflictDecision::Skip => return Ok(()),
+    }
+    let target = tokio::fs::read_link(local_path)
+        .await
+        .map_err(|e| format!("failed to read local symlink: {e}"))?;
+    let target = target.to_string_lossy().to_string();
+    let _ = sftp.remove_file(remote_path).await;
+    sftp.symlink(remote_path, target)
+        .await
+        .map_err(|e| format!("failed to create remote symlink: {e}"))
+}
+
+enum ConflictDecision {
+    Proceed,
+    Skip,
+}
+
+async fn check_remote_conflict(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_path: &str,
+    policy: UploadConflictPolicy,
+) -> Result<ConflictDecision, String> {
+    match sftp.metadata(remote_path).await {
+        Ok(_) => match policy {
+            UploadConflictPolicy::Overwrite => Ok(ConflictDecision::Proceed),
+            UploadConflictPolicy::Skip => Ok(ConflictDecision::Skip),
+            UploadConflictPolicy::Fail => {
+                Err(format!("remote path already exists: {remote_path}"))
+            }
+        },
+        Err(_) => Ok(ConflictDecision::Proceed),
+    }
+}
+
+async fn create_remote_dir_if_missing(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_path: &str,
+) -> Result<(), String> {
+    match sftp.create_dir(remote_path).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let meta = sftp
+                .metadata(remote_path)
+                .await
+                .map_err(|e| format!("failed to create remote directory: {e}"))?;
+            if meta.is_dir() {
+                Ok(())
+            } else {
+                Err("remote path exists and is not a directory".into())
+            }
+        }
+    }
+}
+
+async fn preserve_remote_metadata(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_path: &str,
+    meta: &std::fs::Metadata,
+) {
+    let attrs = russh_sftp::protocol::FileAttributes::from(meta);
+    let _ = sftp.set_metadata(remote_path, attrs).await;
+}
+
+async fn delete_russh(handle: SshSharedHandle, path: &str, is_dir: bool) -> Result<(), String> {
+    let sftp = open_russh_sftp(handle).await?;
     if is_dir {
-        sftp.rmdir(Path::new(path))
-            .map_err(|e| format!("failed to delete remote directory: {e}"))?;
+        remove_dir_all_russh(&sftp, path).await
     } else {
-        sftp.unlink(Path::new(path))
-            .map_err(|e| format!("failed to delete remote file: {e}"))?;
+        sftp.remove_file(path)
+            .await
+            .map_err(|e| format!("failed to delete remote file: {e}"))
+    }
+}
+
+async fn remove_dir_all_russh(
+    sftp: &russh_sftp::client::SftpSession,
+    root: &str,
+) -> Result<(), String> {
+    let mut stack = vec![root.trim_end_matches('/').to_string()];
+    let mut dirs = Vec::new();
+    while let Some(dir) = stack.pop() {
+        dirs.push(dir.clone());
+        let entries = sftp
+            .read_dir(&dir)
+            .await
+            .map_err(|e| format!("failed to read remote directory before delete: {e}"))?;
+        for entry in entries {
+            let path = join_remote_path(&dir, &entry.file_name());
+            if entry.file_type().is_dir() {
+                stack.push(path);
+            } else {
+                sftp.remove_file(&path)
+                    .await
+                    .map_err(|e| format!("failed to delete remote file: {e}"))?;
+            }
+        }
+    }
+    for dir in dirs.iter().rev() {
+        sftp.remove_dir(dir)
+            .await
+            .map_err(|e| format!("failed to delete remote directory: {e}"))?;
     }
     Ok(())
 }
 
-fn rename_blocking(
-    connection: SshConnectionInfo,
+async fn rename_russh(
+    handle: SshSharedHandle,
     path: &str,
     target_path: &str,
 ) -> Result<(), String> {
     if target_path.trim().is_empty() {
         return Err("Target path is required".into());
     }
-    let (_session, sftp) = connect_sftp(connection)?;
-    sftp.rename(Path::new(path), Path::new(target_path), None)
-        .map_err(|e| format!("failed to rename remote entry: {e}"))?;
-    Ok(())
+    let sftp = open_russh_sftp(handle).await?;
+    sftp.rename(path, target_path)
+        .await
+        .map_err(|e| format!("failed to rename remote entry: {e}"))
 }
 
-fn mkdir_blocking(connection: SshConnectionInfo, path: &str) -> Result<(), String> {
+async fn mkdir_russh(handle: SshSharedHandle, path: &str) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("Folder path is required".into());
     }
-    let (_session, sftp) = connect_sftp(connection)?;
-    sftp.mkdir(Path::new(path), 0o755)
-        .map_err(|e| format!("failed to create remote folder: {e}"))?;
-    Ok(())
+    let sftp = open_russh_sftp(handle).await?;
+    sftp.create_dir(path)
+        .await
+        .map_err(|e| format!("failed to create remote folder: {e}"))
 }
 
-fn create_file_blocking(connection: SshConnectionInfo, path: &str) -> Result<(), String> {
+async fn create_file_russh(handle: SshSharedHandle, path: &str) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("File path is required".into());
     }
-    let (_session, sftp) = connect_sftp(connection)?;
+    let sftp = open_russh_sftp(handle).await?;
     let mut remote = sftp
-        .create(Path::new(path))
+        .create(path)
+        .await
         .map_err(|e| format!("failed to create remote file: {e}"))?;
     remote
-        .flush()
-        .map_err(|e| format!("failed to flush remote file: {e}"))?;
-    Ok(())
+        .shutdown()
+        .await
+        .map_err(|e| format!("failed to flush remote file: {e}"))
 }
 
-fn connect_sftp(connection: SshConnectionInfo) -> Result<(ssh2::Session, ssh2::Sftp), String> {
-    let tcp = TcpStream::connect((connection.host.as_str(), connection.port))
-        .map_err(|e| format!("failed to connect for SFTP: {e}"))?;
-    let mut session = ssh2::Session::new().map_err(|e| e.to_string())?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|e| format!("SSH handshake failed: {e}"))?;
-    session
-        .userauth_password(&connection.username, &connection.password)
-        .map_err(|e| format!("SSH authentication failed: {e}"))?;
-    if !session.authenticated() {
-        return Err("SSH authentication failed".into());
+fn join_remote_path(dir: &str, name: &str) -> String {
+    let dir = if dir.trim().is_empty() { "." } else { dir };
+    if dir == "/" {
+        format!("/{name}")
+    } else if dir == "." {
+        name.to_string()
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), name)
     }
+}
 
-    let sftp = session
-        .sftp()
-        .map_err(|e| format!("failed to start SFTP: {e}"))?;
-    Ok((session, sftp))
+fn remote_part_path(path: &str) -> String {
+    if path.ends_with('/') {
+        format!("{}upload.part", path)
+    } else {
+        format!("{path}.part")
+    }
 }

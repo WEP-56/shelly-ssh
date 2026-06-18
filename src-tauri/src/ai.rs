@@ -1,4 +1,4 @@
-use crate::db::{AiMessage, AiProvider, AiToolRun, Db};
+use crate::db::{AiMessage, AiProvider, AiSessionSnapshot, AiToolRun, Db};
 use crate::ssh::SessionStore;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
+
+const TOOL_DISPLAY_OUTPUT_MAX_CHARS: usize = 80_000;
+const TOOL_MODEL_OUTPUT_MAX_CHARS: usize = 12_000;
 
 const STATIC_SYSTEM_PROMPT: &str = r#"[Identity]
 You are Shelly Agent, an SSH operations assistant embedded in Shelly, a desktop SSH client.
@@ -172,6 +175,31 @@ struct AgentStreamResult {
     tool_calls: Vec<AgentToolCall>,
 }
 
+#[derive(Debug, Clone)]
+struct AgentPromptMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentPrompt {
+    system: String,
+    context: String,
+    messages: Vec<AgentPromptMessage>,
+}
+
+impl AgentPrompt {
+    fn estimated_chars(&self) -> usize {
+        self.system.chars().count()
+            + self.context.chars().count()
+            + self
+                .messages
+                .iter()
+                .map(|msg| msg.role.chars().count() + msg.content.chars().count())
+                .sum::<usize>()
+    }
+}
+
 #[tauri::command]
 pub async fn ai_send_message(
     input: AiSendMessageInput,
@@ -238,18 +266,26 @@ async fn run_agent_turn(
 ) -> Result<(), String> {
     let mut messages = db.ai_messages(&conversation.id)?;
     let (provider, api_key) = select_provider_with_key(db, conversation)?;
+    let latest_snapshot = db
+        .latest_ai_session_snapshot(&conversation.id)
+        .ok()
+        .flatten();
 
     let prompt = build_prompt(
         &provider,
         &conversation.server_key,
         active_session_id,
         terminal_context,
+        latest_snapshot.as_ref(),
         &messages,
     );
-    let estimated_tokens = ((prompt.chars().count() as f64) / 4.0).ceil() as i64;
+    let estimated_tokens = ((prompt.estimated_chars() as f64) / 4.0).ceil() as i64;
     db.touch_ai_conversation_tokens(&conversation.id, estimated_tokens)?;
     if estimated_tokens >= provider.context_window_tokens {
-        return Err("Context is over the configured model limit. Create a new session or reduce context.".into());
+        return Err(
+            "Context is over the configured model limit. Create a new session or reduce context."
+                .into(),
+        );
     }
     if estimated_tokens >= provider.context_window_tokens * 9 / 10 {
         emit_status(
@@ -262,8 +298,12 @@ async fn run_agent_turn(
 
     emit_status(app, &conversation.id, "streaming", None);
     let result = match provider.api_kind.as_str() {
-        "openai_responses" => stream_openai(&provider, &api_key, &prompt, app, &conversation.id).await,
-        "claude_messages" => stream_claude(&provider, &api_key, &prompt, app, &conversation.id).await,
+        "openai_responses" => {
+            stream_openai(&provider, &api_key, &prompt, app, &conversation.id).await
+        }
+        "claude_messages" => {
+            stream_claude(&provider, &api_key, &prompt, app, &conversation.id).await
+        }
         other => Err(format!("unsupported provider api kind: {other}")),
     };
 
@@ -284,7 +324,12 @@ async fn run_agent_turn(
                         "user",
                         Some("Shelly internal safety note: You wrote or simulated a tool result in assistant text. That is not allowed. If a command result is needed, call exec_command now and wait for Shelly's real tool result. If no command is needed, answer without any tool/result block."),
                     )?;
-                    emit_status(app, &conversation.id, "streaming", Some("retrying fake tool result"));
+                    emit_status(
+                        app,
+                        &conversation.id,
+                        "streaming",
+                        Some("retrying fake tool result"),
+                    );
                     return Box::pin(run_agent_turn(
                         db,
                         app,
@@ -300,18 +345,26 @@ async fn run_agent_turn(
             let assistant = if stream.text.trim().is_empty() {
                 None
             } else {
-                let assistant = db.append_ai_message(&conversation.id, "assistant", Some(&stream.text))?;
+                let assistant =
+                    db.append_ai_message(&conversation.id, "assistant", Some(&stream.text))?;
                 messages.push(assistant.clone());
                 Some(assistant)
             };
             if stream.tool_calls.is_empty() {
-                if should_reprompt_for_missing_tool(&stream.text) && !last_message_is_tool_reprompt(&messages) {
+                if should_reprompt_for_missing_tool(&stream.text)
+                    && !last_message_is_tool_reprompt(&messages)
+                {
                     db.append_ai_message(
                         &conversation.id,
                         "user",
                         Some("Shelly internal note: You said you would run or try another command, but no exec_command tool call was emitted. If a command is needed, call exec_command now with the exact command. If no command is needed, continue with a direct answer and do not say you will run one."),
                     )?;
-                    emit_status(app, &conversation.id, "streaming", Some("retrying tool request"));
+                    emit_status(
+                        app,
+                        &conversation.id,
+                        "streaming",
+                        Some("retrying tool request"),
+                    );
                     return Box::pin(run_agent_turn(
                         db,
                         app,
@@ -325,6 +378,7 @@ async fn run_agent_turn(
                 return Ok(());
             }
             let mut approval_count = 0;
+            let mut completed_without_approval = 0;
             for call in stream.tool_calls {
                 if call.name != "exec_command" {
                     let note = format!("Model requested unsupported tool '{}'.", call.name);
@@ -360,7 +414,8 @@ async fn run_agent_turn(
                         "Shelly blocked this command before execution: {}",
                         risk_reasons.join("; ")
                     );
-                    let blocked = db.finish_ai_tool_run(&tool_run.id, "blocked", &blocked_output, None)?;
+                    let blocked =
+                        db.finish_ai_tool_run(&tool_run.id, "blocked", &blocked_output, None)?;
                     let _ = app.emit(
                         "ai-tool-result",
                         AiToolResultEvent {
@@ -373,12 +428,28 @@ async fn run_agent_turn(
                     );
                     let tool_message = format_tool_result_message(&blocked, &parsed.cmd);
                     db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
                     continue;
                 }
                 approval_count += 1;
             }
             if approval_count > 0 {
                 emit_status(app, &conversation.id, "waiting_approval", None);
+            } else if completed_without_approval > 0 {
+                emit_status(
+                    app,
+                    &conversation.id,
+                    "streaming",
+                    Some("continuing after tool result"),
+                );
+                return Box::pin(run_agent_turn(
+                    db,
+                    app,
+                    conversation,
+                    active_session_id,
+                    terminal_context,
+                ))
+                .await;
             } else {
                 emit_status(app, &conversation.id, "done", None);
             }
@@ -429,8 +500,41 @@ pub fn ai_approve_tool(input: AiToolDecisionInput, db: State<'_, Db>) -> Result<
 }
 
 #[tauri::command]
-pub fn ai_deny_tool(input: AiToolDecisionInput, db: State<'_, Db>) -> Result<AiToolRun, String> {
-    db.set_ai_tool_approval(&input.tool_run_id, "denied")
+pub async fn ai_deny_tool(
+    input: AiToolDecisionInput,
+    db: State<'_, Db>,
+    app: AppHandle,
+) -> Result<AiToolRun, String> {
+    let denied = db.set_ai_tool_approval(&input.tool_run_id, "denied")?;
+    let command = denied
+        .command
+        .clone()
+        .unwrap_or_else(|| denied.args_json.clone());
+    let output =
+        "User denied this command before execution. No command was written to the SSH terminal.";
+    let finished = db.finish_ai_tool_run(&denied.id, "denied", output, None)?;
+    let _ = app.emit(
+        "ai-tool-result",
+        AiToolResultEvent {
+            conversation_id: finished.conversation_id.clone(),
+            tool_run_id: finished.id.clone(),
+            run_status: finished.run_status.clone(),
+            output: output.to_string(),
+            timed_out: false,
+        },
+    );
+    let tool_message = format_tool_result_message(&finished, &command);
+    db.append_ai_message(&finished.conversation_id, "tool", Some(&tool_message))?;
+    let conversation = db.ai_conversation(&finished.conversation_id)?;
+    let _ = run_agent_turn(
+        &db,
+        &app,
+        &conversation,
+        finished.session_id.as_deref(),
+        None,
+    )
+    .await;
+    Ok(finished)
 }
 
 #[tauri::command]
@@ -465,7 +569,11 @@ pub async fn ai_execute_approved_tool(
             .get(&input.active_session_id)
             .ok_or_else(|| "SSH session is not connected".to_string())?;
         let before = session.output.lock().await.clone();
-        (session.input_tx.clone(), session.output.clone(), before.len())
+        (
+            session.input_tx.clone(),
+            session.output.clone(),
+            before.len(),
+        )
     };
     input_tx
         .send(wrapped_command.into_bytes())
@@ -484,9 +592,14 @@ pub async fn ai_execute_approved_tool(
     );
 
     let captured = capture_command_output(output, before_len, &marker).await;
-    let cleaned = trim_tool_output(&strip_ansi(&captured.output), 20_000);
-    let run_status = if captured.timed_out { "timeout" } else { "completed" };
-    let finished = db.finish_ai_tool_run(&input.tool_run_id, run_status, &cleaned, captured.exit_code)?;
+    let cleaned = trim_tool_output(&strip_ansi(&captured.output), TOOL_DISPLAY_OUTPUT_MAX_CHARS);
+    let run_status = if captured.timed_out {
+        "timeout"
+    } else {
+        "completed"
+    };
+    let finished =
+        db.finish_ai_tool_run(&input.tool_run_id, run_status, &cleaned, captured.exit_code)?;
     let _ = app.emit(
         "ai-tool-output",
         AiToolOutputEvent {
@@ -533,13 +646,16 @@ pub async fn ai_complete_interactive_tool(
         return Err("interactive tool run is not approved by the user".into());
     }
     if run.risk_level != "interactive" {
-        return Err("Only interactive tool runs can be completed with an interactive handoff result.".into());
+        return Err(
+            "Only interactive tool runs can be completed with an interactive handoff result."
+                .into(),
+        );
     }
     let command = run
         .command
         .clone()
         .ok_or_else(|| "tool run has no command".to_string())?;
-    let cleaned = trim_tool_output(&strip_ansi(&input.output), 20_000);
+    let cleaned = trim_tool_output(&strip_ansi(&input.output), TOOL_DISPLAY_OUTPUT_MAX_CHARS);
     let output = if cleaned.trim().is_empty() {
         "Interactive handoff completed by user. No terminal output was captured.".to_string()
     } else {
@@ -620,7 +736,9 @@ fn last_message_is_fake_tool_reprompt(messages: &[AiMessage]) -> bool {
     messages
         .last()
         .and_then(|msg| msg.content.as_deref())
-        .is_some_and(|content| content.starts_with("Shelly internal safety note: You wrote or simulated"))
+        .is_some_and(|content| {
+            content.starts_with("Shelly internal safety note: You wrote or simulated")
+        })
 }
 
 fn emit_tool_approval(
@@ -683,7 +801,11 @@ fn parse_exec_command_args(args_json: &str) -> Result<ExecCommandArgs, String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
-    Ok(ExecCommandArgs { cmd, purpose, interaction_tip })
+    Ok(ExecCommandArgs {
+        cmd,
+        purpose,
+        interaction_tip,
+    })
 }
 
 #[derive(Debug)]
@@ -780,7 +902,37 @@ fn trim_tool_output(output: &str, max_chars: usize) -> String {
         .chars()
         .skip(count.saturating_sub(max_chars))
         .collect::<String>();
-    format!("[output truncated to last {max_chars} chars]\n{}", tail.trim())
+    format!(
+        "[output truncated to last {max_chars} chars]\n{}",
+        tail.trim()
+    )
+}
+
+fn format_model_tool_output(output: &str) -> String {
+    let cleaned = clean_captured_output(output);
+    let char_count = cleaned.chars().count();
+    let line_count = cleaned.lines().count();
+    if char_count <= TOOL_MODEL_OUTPUT_MAX_CHARS {
+        return format!(
+            "[output stats: {line_count} lines, {char_count} chars]\n{}",
+            cleaned.trim()
+        );
+    }
+
+    let head_chars = 5_000;
+    let tail_chars = 5_000;
+    let head = cleaned.chars().take(head_chars).collect::<String>();
+    let tail = cleaned
+        .chars()
+        .skip(char_count.saturating_sub(tail_chars))
+        .collect::<String>();
+    let omitted = char_count.saturating_sub(head_chars + tail_chars);
+    format!(
+        "[output summarized for model context: {line_count} lines, {char_count} chars, {omitted} chars omitted]\n\
+         [head]\n{}\n\n[tail]\n{}",
+        head.trim(),
+        tail.trim()
+    )
 }
 
 fn clean_captured_output(output: &str) -> String {
@@ -803,6 +955,11 @@ fn clean_captured_output(output: &str) -> String {
 }
 
 fn format_tool_result_message(run: &AiToolRun, command: &str) -> String {
+    let model_output = run
+        .output
+        .as_deref()
+        .map(format_model_tool_output)
+        .unwrap_or_else(|| "[output stats: 0 lines, 0 chars]".to_string());
     format!(
         "Tool result for exec_command\ncommand: {}\nstatus: {}\nexit_code: {}\noutput:\n{}",
         command,
@@ -810,7 +967,7 @@ fn format_tool_result_message(run: &AiToolRun, command: &str) -> String {
         run.exit_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
-        run.output.as_deref().unwrap_or("")
+        model_output
     )
 }
 
@@ -838,16 +995,7 @@ fn should_reprompt_for_missing_tool(text: &str) -> bool {
     .iter()
     .any(|needle| normalized.contains(needle));
     let command_words = [
-        "命令",
-        "检查",
-        "执行",
-        "运行",
-        "网络",
-        "磁盘",
-        "内存",
-        "command",
-        "check",
-        "inspect",
+        "命令", "检查", "执行", "运行", "网络", "磁盘", "内存", "command", "check", "inspect",
         "run",
     ]
     .iter()
@@ -880,19 +1028,50 @@ fn analyze_command_risk(cmd: &str) -> CommandRisk {
         };
     }
 
-    let critical_patterns = ["rm -rf /", "--no-preserve-root", ":(){", "mkfs", "dd if=", "dd of=/dev/", "fdisk", "parted"];
-    let high_patterns = ["reboot", "shutdown", "systemctl stop ssh", "systemctl stop sshd", "iptables -f", "ufw disable"];
-    let medium_patterns = ["sudo su", "sudo bash", "passwd", "/etc/shadow", "mysqldump", "pg_dump", "tar "];
+    let critical_patterns = [
+        "rm -rf /",
+        "--no-preserve-root",
+        ":(){",
+        "mkfs",
+        "dd if=",
+        "dd of=/dev/",
+        "fdisk",
+        "parted",
+    ];
+    let high_patterns = [
+        "reboot",
+        "shutdown",
+        "systemctl stop ssh",
+        "systemctl stop sshd",
+        "iptables -f",
+        "ufw disable",
+    ];
+    let medium_patterns = [
+        "sudo su",
+        "sudo bash",
+        "passwd",
+        "/etc/shadow",
+        "mysqldump",
+        "pg_dump",
+        "tar ",
+    ];
 
-    if critical_patterns.iter().any(|pattern| lower.contains(pattern)) {
+    if critical_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
         level = "critical".to_string();
         reasons.push("matches destructive command pattern".to_string());
     } else if high_patterns.iter().any(|pattern| lower.contains(pattern)) {
         level = "high".to_string();
         reasons.push("may disrupt the SSH session or host availability".to_string());
-    } else if medium_patterns.iter().any(|pattern| lower.contains(pattern)) {
+    } else if medium_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
         level = "medium".to_string();
-        reasons.push("may involve privilege changes, credentials, or large data access".to_string());
+        reasons
+            .push("may involve privilege changes, credentials, or large data access".to_string());
     }
 
     if reasons.is_empty() {
@@ -911,12 +1090,42 @@ fn is_interactive_command(lower_cmd: &str) -> bool {
         .find(|part| !part.is_empty())
         .unwrap_or("");
     let interactive_heads = [
-        "read", "passwd", "vi", "vim", "nvim", "nano", "emacs", "top", "htop", "less", "more",
-        "ssh", "sftp", "ftp", "telnet", "mysql", "psql", "redis-cli", "sqlite3", "python",
-        "python3", "node", "irb", "pry", "rails", "bash", "sh", "zsh", "fish", "su",
+        "read",
+        "passwd",
+        "vi",
+        "vim",
+        "nvim",
+        "nano",
+        "emacs",
+        "top",
+        "htop",
+        "less",
+        "more",
+        "ssh",
+        "sftp",
+        "ftp",
+        "telnet",
+        "mysql",
+        "psql",
+        "redis-cli",
+        "sqlite3",
+        "python",
+        "python3",
+        "node",
+        "irb",
+        "pry",
+        "rails",
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "su",
     ];
     if interactive_heads.contains(&head) {
-        if matches!(head, "python" | "python3" | "node" | "bash" | "sh" | "zsh" | "fish") {
+        if matches!(
+            head,
+            "python" | "python3" | "node" | "bash" | "sh" | "zsh" | "fish"
+        ) {
             return !cmd.contains(" -c ") && !cmd.contains(" --command ");
         }
         if head == "mysql" || head == "psql" || head == "redis-cli" || head == "sqlite3" {
@@ -924,10 +1133,15 @@ fn is_interactive_command(lower_cmd: &str) -> bool {
         }
         return true;
     }
-    if cmd == "cat" || cmd.starts_with("cat >") || cmd.contains("| cat >") || cmd.contains("; cat") {
+    if cmd == "cat" || cmd.starts_with("cat >") || cmd.contains("| cat >") || cmd.contains("; cat")
+    {
         return true;
     }
-    if cmd.contains(" tail -f ") || cmd.starts_with("tail -f ") || cmd.contains(" journalctl -f") || cmd.starts_with("journalctl -f") {
+    if cmd.contains(" tail -f ")
+        || cmd.starts_with("tail -f ")
+        || cmd.contains(" journalctl -f")
+        || cmd.starts_with("journalctl -f")
+    {
         return true;
     }
     if cmd.starts_with("watch ") || cmd.contains("; watch ") || cmd.contains("&& watch ") {
@@ -944,36 +1158,155 @@ fn build_prompt(
     server_key: &str,
     active_session_id: Option<&str>,
     terminal_context: Option<&str>,
+    latest_snapshot: Option<&AiSessionSnapshot>,
     messages: &[AiMessage],
-) -> String {
-    let mut out = String::new();
-    out.push_str(STATIC_SYSTEM_PROMPT);
+) -> AgentPrompt {
+    let mut system = String::new();
+    system.push_str(STATIC_SYSTEM_PROMPT);
     if let Some(extra) = provider.system_prompt.as_deref() {
-        out.push_str("\n\n[Provider Custom Instructions]\n");
-        out.push_str(extra);
+        system.push_str("\n\n[Provider Custom Instructions]\n");
+        system.push_str(extra);
     }
-    out.push_str("\n\n## Current Session\n");
-    out.push_str(&format!("- Server Key: {server_key}\n"));
+
+    let mut context = String::new();
+    context.push_str("## Current Session\n");
+    context.push_str(&format!("- Server Key: {server_key}\n"));
     if let Some(active_session_id) = active_session_id {
-        out.push_str(&format!("- Active Session ID: {active_session_id}\n"));
+        context.push_str(&format!("- Active Session ID: {active_session_id}\n"));
     }
-    out.push_str("- Session details: stored in Shelly conversation snapshot when available.\n");
+    if let Some(snapshot) = latest_snapshot {
+        context.push_str(&format!(
+            "- Snapshot Session ID: {}\n",
+            snapshot.session_id.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Device ID: {}\n",
+            snapshot.device_id.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Hostname: {}\n",
+            snapshot.hostname.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- User: {}\n",
+            snapshot.username.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Host: {}:{}\n",
+            snapshot.host.as_deref().unwrap_or("unknown"),
+            snapshot
+                .port
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        context.push_str(&format!(
+            "- OS: {}\n",
+            snapshot.os.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Shell: {}\n",
+            snapshot.shell.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Working Directory: {}\n",
+            snapshot.cwd.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Terminal Title: {}\n",
+            snapshot.terminal_title.as_deref().unwrap_or("unknown")
+        ));
+        context.push_str(&format!(
+            "- Snapshot Captured At: {}\n",
+            snapshot.captured_at
+        ));
+    } else {
+        context.push_str("- Session details: no snapshot has been captured yet.\n");
+    }
     if let Some(terminal_context) = terminal_context.filter(|v| !v.trim().is_empty()) {
-        out.push_str("\n## Current Terminal Context\n");
-        out.push_str(terminal_context);
-        out.push('\n');
+        context.push_str("\n## Current Terminal Context\n");
+        context.push_str(terminal_context);
+        context.push('\n');
     }
-    out.push_str("\n## Conversation\n");
-    for msg in messages.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+
+    let mut prompt_messages = Vec::new();
+    for msg in messages
+        .iter()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if let Some(content) = msg.content.as_deref() {
-            out.push_str(&format!("\n{}:\n{}\n", msg.role, content));
+            prompt_messages.push(AgentPromptMessage {
+                role: provider_message_role(&msg.role).to_string(),
+                content: provider_message_content(&msg.role, content),
+            });
         }
     }
     if messages.last().is_some_and(|msg| msg.role == "tool") {
-        out.push_str("\n## Tool Result Follow-up\n");
-        out.push_str("The latest message is a real Shelly tool result. Continue from that result now. Do not copy its format or write a new tool result yourself. If the next step requires another shell command, call exec_command in this response with the exact command. Do not say you will run a command unless you are calling exec_command now.\n");
+        context.push_str("\n## Tool Result Follow-up\n");
+        context.push_str("The latest message is a real Shelly tool result. Continue from that result now. Do not copy its format or write a new tool result yourself. If the next step requires another shell command, call exec_command in this response with the exact command. Do not say you will run a command unless you are calling exec_command now.\n");
     }
-    out
+
+    AgentPrompt {
+        system,
+        context,
+        messages: prompt_messages,
+    }
+}
+
+fn provider_message_role(role: &str) -> &'static str {
+    match role {
+        "assistant" => "assistant",
+        _ => "user",
+    }
+}
+
+fn provider_message_content(role: &str, content: &str) -> String {
+    match role {
+        "tool" => format!("[Shelly real tool result]\n{content}"),
+        _ => content.to_string(),
+    }
+}
+
+fn openai_input_messages(prompt: &AgentPrompt) -> Vec<Value> {
+    let mut input = vec![json!({
+        "role": "user",
+        "content": format!("[Shelly current context]\n{}", prompt.context)
+    })];
+    input.extend(prompt.messages.iter().map(|msg| {
+        json!({
+            "role": msg.role,
+            "content": msg.content
+        })
+    }));
+    input
+}
+
+fn claude_messages(prompt: &AgentPrompt) -> Vec<Value> {
+    let mut merged: Vec<AgentPromptMessage> = Vec::new();
+    let mut all = vec![AgentPromptMessage {
+        role: "user".to_string(),
+        content: format!("[Shelly current context]\n{}", prompt.context),
+    }];
+    all.extend(prompt.messages.clone());
+
+    for msg in all {
+        if let Some(last) = merged.last_mut() {
+            if last.role == msg.role {
+                last.content.push_str("\n\n");
+                last.content.push_str(&msg.content);
+                continue;
+            }
+        }
+        merged.push(msg);
+    }
+
+    merged
+        .into_iter()
+        .map(|msg| json!({ "role": msg.role, "content": msg.content }))
+        .collect()
 }
 
 fn strip_ansi(line: &str) -> String {
@@ -999,7 +1332,7 @@ fn strip_ansi(line: &str) -> String {
 async fn stream_openai(
     provider: &AiProvider,
     api_key: &str,
-    prompt: &str,
+    prompt: &AgentPrompt,
     app: &AppHandle,
     conversation_id: &str,
 ) -> Result<AgentStreamResult, String> {
@@ -1010,7 +1343,8 @@ async fn stream_openai(
         .bearer_auth(api_key)
         .json(&json!({
             "model": provider.model,
-            "input": prompt,
+            "instructions": prompt.system,
+            "input": openai_input_messages(prompt),
             "stream": true,
             "tools": [exec_command_tool_schema_openai()],
             "tool_choice": "auto",
@@ -1021,7 +1355,10 @@ async fn stream_openai(
         .await
         .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
-        return Err(format!("OpenAI request failed: {}", res.text().await.unwrap_or_default()));
+        return Err(format!(
+            "OpenAI request failed: {}",
+            res.text().await.unwrap_or_default()
+        ));
     }
     stream_openai_sse(res, app, conversation_id).await
 }
@@ -1029,7 +1366,7 @@ async fn stream_openai(
 async fn stream_claude(
     provider: &AiProvider,
     api_key: &str,
-    prompt: &str,
+    prompt: &AgentPrompt,
     app: &AppHandle,
     conversation_id: &str,
 ) -> Result<AgentStreamResult, String> {
@@ -1045,13 +1382,17 @@ async fn stream_claude(
             "temperature": provider.temperature,
             "stream": true,
             "tools": [exec_command_tool_schema_claude()],
-            "messages": [{ "role": "user", "content": prompt }]
+            "system": prompt.system,
+            "messages": claude_messages(prompt)
         }))
         .send()
         .await
         .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
-        return Err(format!("Claude request failed: {}", res.text().await.unwrap_or_default()));
+        return Err(format!(
+            "Claude request failed: {}",
+            res.text().await.unwrap_or_default()
+        ));
     }
     stream_claude_sse(res, app, conversation_id).await
 }
@@ -1240,7 +1581,10 @@ fn max_suffix_prefix_overlap(existing: &str, incoming: &str) -> usize {
 }
 
 fn parse_openai_tool_event(value: &Value, calls: &mut Vec<AgentToolCall>) {
-    let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match event_type {
         "response.output_item.added" | "response.output_item.done" => {
             let item = match value.get("item") {
@@ -1284,7 +1628,10 @@ fn parse_openai_tool_event(value: &Value, calls: &mut Vec<AgentToolCall>) {
             if id.is_empty() {
                 return;
             }
-            let delta = value.get("delta").and_then(Value::as_str).unwrap_or_default();
+            let delta = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if delta.is_empty() {
                 return;
             }
@@ -1333,7 +1680,10 @@ fn parse_claude_tool_event(
     calls: &mut Vec<AgentToolCall>,
     current_tool_index: &mut Option<usize>,
 ) {
-    let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match event_type {
         "content_block_start" => {
             let block = match value.get("content_block") {
@@ -1382,7 +1732,11 @@ fn parse_claude_tool_event(
             if partial.is_empty() {
                 return;
             }
-            if let Some(index) = value.get("index").and_then(Value::as_u64).map(|v| v as usize) {
+            if let Some(index) = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+            {
                 if index < calls.len() {
                     calls[index].args_json.push_str(partial);
                     *current_tool_index = Some(index);
@@ -1402,7 +1756,11 @@ fn parse_claude_tool_event(
     }
 }
 
-fn upsert_tool_call(calls: &mut Vec<AgentToolCall>, id: String, name: String) -> &mut AgentToolCall {
+fn upsert_tool_call(
+    calls: &mut Vec<AgentToolCall>,
+    id: String,
+    name: String,
+) -> &mut AgentToolCall {
     if let Some(index) = calls.iter().position(|call| call.id == id) {
         if !name.is_empty() && calls[index].name.is_empty() {
             calls[index].name = name;

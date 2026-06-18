@@ -23,8 +23,11 @@ pub struct Device {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub auth_method: String,
+    pub private_key_path: Option<String>,
     pub session_id: Option<String>,
     pub remember_password: bool,
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -37,6 +40,8 @@ pub struct SaveDeviceInput {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub auth_method: Option<String>,
+    pub private_key_path: Option<String>,
     pub remember_password: bool,
 }
 
@@ -204,15 +209,37 @@ pub struct AiToolRun {
 
 impl Db {
     pub fn open(app: &AppHandle) -> Result<Self, String> {
+        #[cfg(debug_assertions)]
+        let started = std::time::Instant::now();
         let data_dir = app
             .path()
             .app_data_dir()
             .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[startup] resolved app data dir in {}ms: {}",
+            started.elapsed().as_millis(),
+            data_dir.display()
+        );
         fs::create_dir_all(&data_dir).map_err(|e| format!("failed to create app data dir: {e}"))?;
+        #[cfg(debug_assertions)]
+        let sqlite_started = std::time::Instant::now();
 
         let db_path = data_dir.join("shelly.sqlite3");
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[startup] sqlite open completed in {}ms",
+            sqlite_started.elapsed().as_millis()
+        );
+        #[cfg(debug_assertions)]
+        let schema_started = std::time::Instant::now();
         init_schema(&conn)?;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[startup] sqlite schema init completed in {}ms",
+            schema_started.elapsed().as_millis()
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -246,7 +273,11 @@ impl Db {
         Ok((provider, key))
     }
 
-    pub fn device_password(&self, device_id: &str, device: Option<&Device>) -> Result<Option<String>, String> {
+    pub fn device_password(
+        &self,
+        device_id: &str,
+        device: Option<&Device>,
+    ) -> Result<Option<String>, String> {
         let conn = self
             .conn
             .lock()
@@ -330,7 +361,11 @@ impl Db {
         )
     }
 
-    pub fn set_ai_tool_approval(&self, tool_run_id: &str, approval_status: &str) -> Result<AiToolRun, String> {
+    pub fn set_ai_tool_approval(
+        &self,
+        tool_run_id: &str,
+        approval_status: &str,
+    ) -> Result<AiToolRun, String> {
         let conn = self
             .conn
             .lock()
@@ -358,7 +393,36 @@ impl Db {
         get_ai_tool_run(&conn, tool_run_id)
     }
 
-    pub fn start_ai_tool_run(&self, tool_run_id: &str, session_id: &str) -> Result<AiToolRun, String> {
+    pub fn latest_ai_session_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<AiSessionSnapshot>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conversation_id, server_key, session_id, device_id, hostname, username,
+                        host, port, os, shell, cwd, terminal_title, captured_at
+                 FROM ai_session_snapshots
+                 WHERE conversation_id = ?1
+                 ORDER BY captured_at DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        match stmt.query_row(params![conversation_id], ai_snapshot_from_row) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    pub fn start_ai_tool_run(
+        &self,
+        tool_run_id: &str,
+        session_id: &str,
+    ) -> Result<AiToolRun, String> {
         let conn = self
             .conn
             .lock()
@@ -406,8 +470,11 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             host TEXT NOT NULL,
             port INTEGER NOT NULL,
             username TEXT NOT NULL,
+            auth_method TEXT NOT NULL DEFAULT 'password',
+            private_key_path TEXT,
             session_id TEXT,
             remember_password INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
@@ -552,6 +619,24 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         "remember_password",
         "ALTER TABLE devices ADD COLUMN remember_password INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        conn,
+        "devices",
+        "auth_method",
+        "ALTER TABLE devices ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'password'",
+    )?;
+    ensure_column(
+        conn,
+        "devices",
+        "private_key_path",
+        "ALTER TABLE devices ADD COLUMN private_key_path TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "devices",
+        "pinned",
+        "ALTER TABLE devices ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -590,12 +675,14 @@ fn lock_conn<'a>(db: &'a State<'_, Db>) -> Result<std::sync::MutexGuard<'a, Conn
 
 #[tauri::command]
 pub fn db_list_devices(db: State<'_, Db>) -> Result<Vec<Device>, String> {
+    #[cfg(debug_assertions)]
+    let started = std::time::Instant::now();
     let conn = lock_conn(&db)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, host, port, username, session_id, remember_password, created_at, updated_at
+            "SELECT id, name, host, port, username, auth_method, private_key_path, session_id, remember_password, pinned, created_at, updated_at
              FROM devices
-             ORDER BY updated_at DESC",
+             ORDER BY pinned DESC, updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -606,16 +693,27 @@ pub fn db_list_devices(db: State<'_, Db>) -> Result<Vec<Device>, String> {
                 host: row.get(2)?,
                 port: row.get::<_, u16>(3)?,
                 username: row.get(4)?,
-                session_id: row.get(5)?,
-                remember_password: row.get::<_, i64>(6)? != 0,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
+                auth_method: row.get(5)?,
+                private_key_path: row.get(6)?,
+                session_id: row.get(7)?,
+                remember_password: row.get::<_, i64>(8)? != 0,
+                pinned: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+    let devices = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[perf] db_list_devices returned {} devices in {}ms",
+        devices.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(devices)
 }
 
 #[tauri::command]
@@ -626,13 +724,15 @@ pub fn db_save_device(input: SaveDeviceInput, db: State<'_, Db>) -> Result<Devic
 
     conn.execute(
         r#"
-        INSERT INTO devices (id, name, host, port, username, remember_password, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+        INSERT INTO devices (id, name, host, port, username, auth_method, private_key_path, remember_password, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             host = excluded.host,
             port = excluded.port,
             username = excluded.username,
+            auth_method = excluded.auth_method,
+            private_key_path = excluded.private_key_path,
             remember_password = excluded.remember_password,
             updated_at = excluded.updated_at
         "#,
@@ -642,6 +742,8 @@ pub fn db_save_device(input: SaveDeviceInput, db: State<'_, Db>) -> Result<Devic
             input.host,
             input.port,
             input.username,
+            input.auth_method.unwrap_or_else(|| "password".into()),
+            input.private_key_path.filter(|v| !v.trim().is_empty()),
             if input.remember_password { 1 } else { 0 },
             now
         ],
@@ -667,6 +769,21 @@ pub fn db_update_device_session(
 }
 
 #[tauri::command]
+pub fn db_set_device_pinned(
+    device_id: String,
+    pinned: bool,
+    db: State<'_, Db>,
+) -> Result<Device, String> {
+    let conn = lock_conn(&db)?;
+    conn.execute(
+        "UPDATE devices SET pinned = ?1, updated_at = ?2 WHERE id = ?3",
+        params![if pinned { 1 } else { 0 }, now_ms(), device_id],
+    )
+    .map_err(|e| e.to_string())?;
+    get_device(&conn, &device_id)
+}
+
+#[tauri::command]
 pub fn db_delete_device(id: String, db: State<'_, Db>) -> Result<(), String> {
     let device = db.device(&id).ok();
     let conn = lock_conn(&db)?;
@@ -681,8 +798,17 @@ pub fn db_get_device_password(
     device_id: String,
     db: State<'_, Db>,
 ) -> Result<Option<String>, String> {
+    #[cfg(debug_assertions)]
+    let started = std::time::Instant::now();
     let device = db.device(&device_id).ok();
-    db.device_password(&device_id, device.as_ref())
+    let password = db.device_password(&device_id, device.as_ref())?;
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[perf] db_get_device_password completed in {}ms (found={})",
+        started.elapsed().as_millis(),
+        password.is_some()
+    );
+    Ok(password)
 }
 
 #[tauri::command]
@@ -758,6 +884,33 @@ pub fn db_list_command_history(
             params![limit],
         )
     }
+}
+
+#[tauri::command]
+pub fn db_delete_command_history(id: String, db: State<'_, Db>) -> Result<(), String> {
+    let conn = lock_conn(&db)?;
+    conn.execute("DELETE FROM command_history WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn db_clear_command_history(
+    device_id: Option<String>,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    let conn = lock_conn(&db)?;
+    if let Some(device_id) = device_id {
+        conn.execute(
+            "DELETE FROM command_history WHERE device_id = ?1",
+            params![device_id],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute("DELETE FROM command_history", [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -837,7 +990,8 @@ pub fn db_list_ai_providers(db: State<'_, Db>) -> Result<Vec<AiProvider>, String
     let rows = stmt
         .query_map([], ai_provider_from_row)
         .map_err(|e| e.to_string())?;
-    let mut providers = rows.collect::<Result<Vec<_>, _>>()
+    let mut providers = rows
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     for provider in &mut providers {
         provider.has_api_key = load_ai_provider_key_inner(&conn, &provider.id)?.is_some();
@@ -846,7 +1000,10 @@ pub fn db_list_ai_providers(db: State<'_, Db>) -> Result<Vec<AiProvider>, String
 }
 
 #[tauri::command]
-pub fn db_save_ai_provider(input: SaveAiProviderInput, db: State<'_, Db>) -> Result<AiProvider, String> {
+pub fn db_save_ai_provider(
+    input: SaveAiProviderInput,
+    db: State<'_, Db>,
+) -> Result<AiProvider, String> {
     let name = input.name.trim().to_string();
     let api_kind = input.api_kind.trim().to_string();
     let base_url = input.base_url.trim().trim_end_matches('/').to_string();
@@ -871,9 +1028,13 @@ pub fn db_save_ai_provider(input: SaveAiProviderInput, db: State<'_, Db>) -> Res
     let max_tokens = input.max_tokens.unwrap_or(4096).max(1);
     let timeout_secs = input.timeout_secs.unwrap_or(120).clamp(10, 600);
     let is_default = input.is_default.unwrap_or(false);
-    let system_prompt = input
-        .system_prompt
-        .and_then(|v| if v.trim().is_empty() { None } else { Some(v.trim().to_string()) });
+    let system_prompt = input.system_prompt.and_then(|v| {
+        if v.trim().is_empty() {
+            None
+        } else {
+            Some(v.trim().to_string())
+        }
+    });
 
     let conn = lock_conn(&db)?;
     if is_default {
@@ -917,15 +1078,24 @@ pub fn db_save_ai_provider(input: SaveAiProviderInput, db: State<'_, Db>) -> Res
         ],
     )
     .map_err(|e| e.to_string())?;
-    if input.api_key.as_ref().is_some_and(|key| !key.trim().is_empty()) {
+    if input
+        .api_key
+        .as_ref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
         save_ai_provider_key_inner(&conn, &id, input.api_key.as_ref().unwrap().trim())?;
     }
     let provider_count = conn
-        .query_row("SELECT COUNT(*) FROM ai_providers", [], |row| row.get::<_, i64>(0))
+        .query_row("SELECT COUNT(*) FROM ai_providers", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .map_err(|e| e.to_string())?;
     if provider_count == 1 {
-        conn.execute("UPDATE ai_providers SET is_default = 1 WHERE id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE ai_providers SET is_default = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
     }
     get_ai_provider(&conn, &id)
 }
@@ -1001,16 +1171,21 @@ pub fn db_list_ai_conversations(
     db: State<'_, Db>,
 ) -> Result<Vec<AiConversation>, String> {
     let conn = lock_conn(&db)?;
-    let mut sql = "SELECT id, server_key, device_id, active_session_id, latest_snapshot_id, provider_id,
+    let mut sql =
+        "SELECT id, server_key, device_id, active_session_id, latest_snapshot_id, provider_id,
                           title, estimated_tokens, status, created_at, updated_at
                    FROM ai_conversations"
-        .to_string();
+            .to_string();
     let mut clauses = Vec::new();
     if server_key.as_ref().is_some_and(|v| !v.trim().is_empty()) {
         clauses.push("server_key = ?1");
     }
     if device_id.as_ref().is_some_and(|v| !v.trim().is_empty()) {
-        clauses.push(if clauses.is_empty() { "device_id = ?1" } else { "device_id = ?2" });
+        clauses.push(if clauses.is_empty() {
+            "device_id = ?1"
+        } else {
+            "device_id = ?2"
+        });
     }
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
@@ -1019,7 +1194,9 @@ pub fn db_list_ai_conversations(
     sql.push_str(" ORDER BY updated_at DESC");
 
     match (server_key, device_id) {
-        (Some(server_key), Some(device_id)) if !server_key.trim().is_empty() && !device_id.trim().is_empty() => {
+        (Some(server_key), Some(device_id))
+            if !server_key.trim().is_empty() && !device_id.trim().is_empty() =>
+        {
             list_ai_conversations_with_params(&conn, &sql, params![server_key, device_id])
         }
         (Some(server_key), _) if !server_key.trim().is_empty() => {
@@ -1083,7 +1260,7 @@ pub fn db_list_ai_messages(
 
 fn get_device(conn: &Connection, id: &str) -> Result<Device, String> {
     conn.query_row(
-        "SELECT id, name, host, port, username, session_id, remember_password, created_at, updated_at
+        "SELECT id, name, host, port, username, auth_method, private_key_path, session_id, remember_password, pinned, created_at, updated_at
          FROM devices
          WHERE id = ?1",
         params![id],
@@ -1094,10 +1271,13 @@ fn get_device(conn: &Connection, id: &str) -> Result<Device, String> {
                 host: row.get(2)?,
                 port: row.get::<_, u16>(3)?,
                 username: row.get(4)?,
-                session_id: row.get(5)?,
-                remember_password: row.get::<_, i64>(6)? != 0,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
+                auth_method: row.get(5)?,
+                private_key_path: row.get(6)?,
+                session_id: row.get(7)?,
+                remember_password: row.get::<_, i64>(8)? != 0,
+                pinned: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         },
     )
@@ -1197,7 +1377,9 @@ fn delete_device_password_inner(
 ) -> Result<(), String> {
     let mut last_err: Option<String> = None;
     for account in credential_accounts(device_id, device) {
-        match credential_entry(&account).and_then(|entry| entry.delete_credential().map_err(|e| e.to_string())) {
+        match credential_entry(&account)
+            .and_then(|entry| entry.delete_credential().map_err(|e| e.to_string()))
+        {
             Ok(()) => {}
             Err(e) if e.contains("NoEntry") => {}
             Err(e) => last_err = Some(e),
@@ -1284,7 +1466,10 @@ fn load_ai_provider_key(provider_id: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn load_ai_provider_key_inner(conn: &Connection, provider_id: &str) -> Result<Option<String>, String> {
+fn load_ai_provider_key_inner(
+    conn: &Connection,
+    provider_id: &str,
+) -> Result<Option<String>, String> {
     if let Ok(Some(key)) = load_ai_provider_key(provider_id) {
         return Ok(Some(key));
     }
@@ -1297,7 +1482,11 @@ fn save_ai_provider_key(provider_id: &str, api_key: &str) -> Result<(), String> 
         .map_err(|e| e.to_string())
 }
 
-fn save_ai_provider_key_inner(conn: &Connection, provider_id: &str, api_key: &str) -> Result<(), String> {
+fn save_ai_provider_key_inner(
+    conn: &Connection,
+    provider_id: &str,
+    api_key: &str,
+) -> Result<(), String> {
     let _ = save_ai_provider_key(provider_id, api_key);
     save_cached_credential(conn, "ai_provider_key", provider_id, api_key)
 }
@@ -1336,30 +1525,32 @@ fn ai_provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiProvider>
 }
 
 fn get_ai_provider(conn: &Connection, id: &str) -> Result<AiProvider, String> {
-    let mut provider = conn.query_row(
-        "SELECT id, name, api_kind, base_url, model, context_window_tokens, temperature,
+    let mut provider = conn
+        .query_row(
+            "SELECT id, name, api_kind, base_url, model, context_window_tokens, temperature,
                 max_tokens, top_p, timeout_secs, system_prompt, is_default, created_at, updated_at
          FROM ai_providers
          WHERE id = ?1",
-        params![id],
-        ai_provider_from_row,
-    )
-    .map_err(|e| e.to_string())?;
+            params![id],
+            ai_provider_from_row,
+        )
+        .map_err(|e| e.to_string())?;
     provider.has_api_key = load_ai_provider_key_inner(conn, &provider.id)?.is_some();
     Ok(provider)
 }
 
 fn get_default_ai_provider(conn: &Connection) -> Result<AiProvider, String> {
-    let mut provider = conn.query_row(
-        "SELECT id, name, api_kind, base_url, model, context_window_tokens, temperature,
+    let mut provider = conn
+        .query_row(
+            "SELECT id, name, api_kind, base_url, model, context_window_tokens, temperature,
                 max_tokens, top_p, timeout_secs, system_prompt, is_default, created_at, updated_at
          FROM ai_providers
          ORDER BY is_default DESC, updated_at DESC
          LIMIT 1",
-        [],
-        ai_provider_from_row,
-    )
-    .map_err(|e| e.to_string())?;
+            [],
+            ai_provider_from_row,
+        )
+        .map_err(|e| e.to_string())?;
     provider.has_api_key = load_ai_provider_key_inner(conn, &provider.id)?.is_some();
     Ok(provider)
 }
@@ -1509,7 +1700,10 @@ fn ai_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiMessage> {
     })
 }
 
-fn list_ai_messages_inner(conn: &Connection, conversation_id: &str) -> Result<Vec<AiMessage>, String> {
+fn list_ai_messages_inner(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<AiMessage>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, conversation_id, role, content, tool_call_id, tool_name, tool_args_json, created_at

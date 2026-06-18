@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Connection } from '../store'
+import { useI18n, tr, type I18nKey } from '../i18n'
 import {
   approveAiTool,
+  bindAiConversationSession,
   completeInteractiveAiTool,
   createAiConversation,
   denyAiTool,
@@ -15,6 +17,7 @@ import {
   onAiStreamReset,
   onAiToolApproval,
   onAiToolResult,
+  onAiToolStarted,
   readTerminal,
   saveAiProvider,
   sendAiMessage,
@@ -22,6 +25,7 @@ import {
   type AiMessage,
   type AiProvider,
   type AiProviderKind,
+  type SaveAiSessionSnapshotInput,
 } from '../lib/ai'
 import { sshInput } from '../lib/ssh'
 
@@ -42,12 +46,14 @@ type InteractivePrompt = { approval: Approval; dontShowAgain: boolean }
 type InteractiveHandoff = { approval: Approval; sessionId: string; baselineText: string }
 
 export function AgentPanel({ active, width }: { active: Connection | undefined; width: number }) {
+  const { language, t } = useI18n()
   const [providers, setProviders] = useState<AiProvider[]>([])
   const [conversation, setConversation] = useState<AiConversation | null>(null)
   const [conversations, setConversations] = useState<AiConversation[]>([])
   const [lines, setLines] = useState<Line[]>([])
   const [input, setInput] = useState('')
   const [status, setStatus] = useState('idle')
+  const [statusTick, setStatusTick] = useState(0)
   const [notice, setNotice] = useState('')
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [interactivePrompt, setInteractivePrompt] = useState<InteractivePrompt | null>(null)
@@ -98,6 +104,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     let unReset: (() => void) | undefined
     let unError: (() => void) | undefined
     let unApproval: (() => void) | undefined
+    let unToolStarted: (() => void) | undefined
     let unToolResult: (() => void) | undefined
     let disposed = false
     onAiStatus(e => {
@@ -145,19 +152,29 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       setApprovals(prev => prev.some(item => item.id === approval.id) ? prev : [approval, ...prev])
       setLines(prev => [
         ...prev.filter(line => !(line.pending && !line.text)),
-        { id: `approval-line-${approval.id}`, role: 'tool', text: `approval requested (${approval.riskLevel ?? 'unknown'})\n$ ${cmd}` },
+        { id: `approval-line-${approval.id}`, role: 'tool', text: `${t('shell.approvalRequested')} (${approval.riskLevel ?? 'unknown'})\n$ ${cmd}` },
       ])
     }).then(fn => { if (disposed) fn(); else unApproval = fn })
+    onAiToolStarted(e => {
+      if (conversation && e.conversationId !== conversation.id) return
+      setStatus('executing_tool')
+      setLines(prev => {
+        const id = `${e.toolRunId}-started`
+        if (prev.some(line => line.id === id)) return prev
+        return [...prev, { id, role: 'tool', text: `${t('shell.commandRunning')}\n$ ${e.command}` }]
+      })
+    }).then(fn => { if (disposed) fn(); else unToolStarted = fn })
     onAiToolResult(e => {
       if (conversation && e.conversationId !== conversation.id) return
       setInteractiveHandoff(prev => prev?.approval.toolRunId === e.toolRunId ? null : prev)
+      if (e.runStatus === 'timeout') setStatus('timeout')
       setLines(prev => {
         const id = `${e.toolRunId}-result`
         if (prev.some(line => line.id === id)) return prev
         return [...prev, {
           id,
           role: 'tool',
-          text: `${e.timedOut ? 'capture timed out' : 'captured output'}\n${e.output}`,
+          text: `${toolResultLabel(e.runStatus, e.timedOut, language)} (${e.runStatus})\n${e.output}`,
         }]
       })
     }).then(fn => { if (disposed) fn(); else unToolResult = fn })
@@ -168,9 +185,10 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       unReset?.()
       unError?.()
       unApproval?.()
+      unToolStarted?.()
       unToolResult?.()
     }
-  }, [conversation?.id])
+  }, [conversation?.id, language])
 
   useEffect(() => {
     return () => {
@@ -179,6 +197,14 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       }
     }
   }, [])
+
+  useEffect(() => {
+    if (!isWorkingStatus(status)) return
+    const timer = window.setInterval(() => {
+      setStatusTick(tick => (tick + 1) % 4)
+    }, 420)
+    return () => window.clearInterval(timer)
+  }, [status])
 
   useEffect(() => {
     transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight })
@@ -271,9 +297,9 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
   }
 
   const header = useMemo(() => {
-    if (!active) return 'No SSH session'
+    if (!active) return t('shell.noSshSession')
     return `${active.name}  ${activeServerKey}`
-  }, [active, activeServerKey])
+  }, [active, activeServerKey, t])
 
   const loadMessages = async (conversationId: string) => {
     const messages = await listAiMessages(conversationId)
@@ -281,7 +307,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
   }
 
   const ensureConversation = async () => {
-    if (!active || !activeServerKey) throw new Error('No active SSH connection')
+    if (!active || !activeServerKey) throw new Error(t('shell.noActiveConnection'))
     if (conversation) return conversation
     const created = await createAiConversation({
       serverKey: activeServerKey,
@@ -289,16 +315,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       activeSessionId: active.sessionId ?? null,
       providerId: defaultProvider?.id ?? null,
       title: `Session ${new Date().toLocaleString()}`,
-      snapshot: {
-        serverKey: activeServerKey,
-        sessionId: active.sessionId ?? null,
-        deviceId: active.id,
-        hostname: active.name,
-        username: active.username,
-        host: active.host,
-        port: active.port,
-        terminalTitle: active.name,
-      },
+      snapshot: buildSessionSnapshot(active, activeServerKey),
     })
     setConversation(created)
     setConversations(prev => [created, ...prev])
@@ -313,16 +330,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       activeSessionId: active.sessionId ?? null,
       providerId: defaultProvider?.id ?? null,
       title: `Session ${new Date().toLocaleString()}`,
-      snapshot: {
-        serverKey: activeServerKey,
-        sessionId: active.sessionId ?? null,
-        deviceId: active.id,
-        hostname: active.name,
-        username: active.username,
-        host: active.host,
-        port: active.port,
-        terminalTitle: active.name,
-      },
+      snapshot: buildSessionSnapshot(active, activeServerKey),
     })
     setConversation(created)
     setConversations(prev => [created, ...prev])
@@ -358,11 +366,11 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       const approval = {
         id: `approval-${Date.now()}`,
         cmd,
-        purpose: 'Manual exec_command request from Agent panel.',
+        purpose: t('shell.manualExecPurpose'),
         status: 'pending' as const,
       }
       setApprovals(prev => [approval, ...prev])
-      setLines(prev => [...prev, { id: approval.id, role: 'tool', text: `approval requested\n$ ${cmd}` }])
+      setLines(prev => [...prev, { id: approval.id, role: 'tool', text: `${t('shell.approvalRequested')}\n$ ${cmd}` }])
       return
     }
     const conv = await ensureConversation()
@@ -372,8 +380,9 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       if (active?.sessionId) {
         try {
           terminalContext = (await readTerminal(active.sessionId, 120)).text
+          await refreshConversationSnapshot(conv.id, terminalContext)
         } catch (err) {
-          setNotice(`Terminal context unavailable: ${String(err)}`)
+          setNotice(t('shell.terminalContextUnavailable').replace('{error}', String(err)))
         }
       }
       await sendAiMessage(conv.id, active?.sessionId ?? null, text, terminalContext)
@@ -395,9 +404,18 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     setProviderForm(prev => ({ ...prev, apiKey: '' }))
   }
 
+  const refreshConversationSnapshot = async (conversationId: string, terminalContext: string | null) => {
+    if (!active || !activeServerKey) return
+    await bindAiConversationSession(
+      conversationId,
+      active.sessionId ?? null,
+      buildSessionSnapshot(active, activeServerKey, terminalContext),
+    )
+  }
+
   const approveExec = async (approval: Approval) => {
     if (!active?.sessionId) {
-      setNotice('No active SSH session to execute command.')
+      setNotice(t('shell.noActiveSession'))
       return
     }
     if (approval.riskLevel === 'interactive') {
@@ -411,7 +429,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     if (approval.toolRunId) {
       await approveAiTool(approval.toolRunId)
       setApprovals(prev => prev.map(item => item.id === approval.id ? { ...item, status: 'approved' } : item))
-      setLines(prev => [...prev, { id: `${approval.id}-approved`, role: 'tool', text: `approved and written to main SSH terminal\n$ ${approval.cmd}` }])
+      setLines(prev => [...prev, { id: `${approval.id}-approved`, role: 'tool', text: `${t('shell.toolApproved')}\n$ ${approval.cmd}` }])
       setStatus('executing_tool')
       try {
         await executeApprovedAiTool(approval.toolRunId, active.sessionId)
@@ -423,13 +441,13 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     }
     await sshInput(active.sessionId, Array.from(new TextEncoder().encode(`${approval.cmd}\n`)))
     setApprovals(prev => prev.map(item => item.id === approval.id ? { ...item, status: 'approved' } : item))
-    setLines(prev => [...prev, { id: `${approval.id}-approved`, role: 'tool', text: `approved and written to main SSH terminal\n$ ${approval.cmd}` }])
+    setLines(prev => [...prev, { id: `${approval.id}-approved`, role: 'tool', text: `${t('shell.toolApproved')}\n$ ${approval.cmd}` }])
     setStatus('done')
   }
 
   const startInteractiveHandoff = async (approval: Approval) => {
     if (!active?.sessionId) {
-      setNotice('No active SSH session to execute command.')
+      setNotice(t('shell.noActiveSession'))
       return
     }
     if (approval.toolRunId) {
@@ -446,7 +464,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     setLines(prev => [...prev, {
       id: `${approval.id}-interactive`,
       role: 'tool',
-      text: `interactive handoff started\n$ ${approval.cmd}\nShelly Agent will not type follow-up input. Continue in the main SSH terminal, then press continue here.`,
+      text: `${t('shell.handoffStarted')}\n$ ${approval.cmd}\n${t('shell.handoffWaitingHint')}`,
     }])
     setStatus('interactive_handoff')
   }
@@ -463,10 +481,12 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
 
   const denyExec = async (approval: Approval) => {
     if (approval.toolRunId) {
+      setApprovals(prev => prev.map(item => item.id === approval.id ? { ...item, status: 'denied' } : item))
       await denyAiTool(approval.toolRunId)
+      return
     }
     setApprovals(prev => prev.map(item => item.id === approval.id ? { ...item, status: 'denied' } : item))
-    setLines(prev => [...prev, { id: `${approval.id}-denied`, role: 'tool', text: `denied\n$ ${approval.cmd}` }])
+    setLines(prev => [...prev, { id: `${approval.id}-denied`, role: 'tool', text: `${t('shell.denied')}\n$ ${approval.cmd}` }])
     setStatus('done')
   }
 
@@ -480,7 +500,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       setLines(prev => [...prev, {
         id: `${interactiveHandoff.approval.id}-interactive-complete`,
         role: 'tool',
-        text: `interactive handoff completed\ncaptured ${output.length} chars; continuing Agent`,
+        text: `${t('shell.handoffComplete')}\n${t('shell.handoffCaptured').replace('{count}', String(output.length))}`,
       }])
       await completeInteractiveAiTool(interactiveHandoff.approval.toolRunId, interactiveHandoff.sessionId, output)
       setInteractiveHandoff(null)
@@ -495,7 +515,7 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     setLines(prev => [...prev, {
       id: `${interactiveHandoff.approval.id}-interactive-dismissed`,
       role: 'tool',
-      text: 'interactive handoff dismissed; Agent will not continue from this command result',
+      text: t('shell.handoffDismissed'),
     }])
     setInteractiveHandoff(null)
     setStatus('done')
@@ -536,47 +556,47 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
   }
 
   if (!active) {
-    return <div style={s.empty}>Connect to an SSH session to start Shelly Agent.</div>
+    return <div style={s.empty}>{t('shell.noSshSession')}</div>
   }
 
   return (
     <div style={s.root}>
       <div style={s.status}>
-        <span style={s.dot} />
+        <span style={{ ...s.dot, ...statusDotStyle(status, statusTick) }} />
         <span style={s.statusText}>{header}</span>
-        <span style={s.runState}>{statusLabel(status)}</span>
-        <span style={s.badge}>{defaultProvider?.model ?? 'no provider'}</span>
+        <span style={s.runState}>{statusLabel(status, statusTick, language)}</span>
+        <span style={s.badge}>{defaultProvider?.model ?? t('shell.noProvider')}</span>
       </div>
 
       {providers.length === 0 && (
         <div style={s.providerBox}>
-          <div style={s.sectionTitle}>provider</div>
-          <input style={s.input} value={providerForm.name} onChange={e => setProviderForm(v => ({ ...v, name: e.target.value }))} placeholder="Provider name" />
+          <div style={s.sectionTitle}>{t('shell.provider')}</div>
+          <input style={s.input} value={providerForm.name} onChange={e => setProviderForm(v => ({ ...v, name: e.target.value }))} placeholder={t('model.providerName')} />
           <select style={s.input} value={providerForm.apiKind} onChange={e => setProviderForm(v => ({ ...v, apiKind: e.target.value as AiProviderKind }))}>
             <option value="openai_responses">OpenAI Responses</option>
             <option value="claude_messages">Claude Messages</option>
           </select>
-          <input style={s.input} value={providerForm.baseUrl} onChange={e => setProviderForm(v => ({ ...v, baseUrl: e.target.value }))} placeholder="Base URL" />
-          <input style={s.input} value={providerForm.model} onChange={e => setProviderForm(v => ({ ...v, model: e.target.value }))} placeholder="Model" />
-          <input style={s.input} type="password" value={providerForm.apiKey} onChange={e => setProviderForm(v => ({ ...v, apiKey: e.target.value }))} placeholder="API key" />
-          <button style={s.primaryBtn} onClick={saveProviderForm}>save provider</button>
+          <input style={s.input} value={providerForm.baseUrl} onChange={e => setProviderForm(v => ({ ...v, baseUrl: e.target.value }))} placeholder={t('model.baseUrl')} />
+          <input style={s.input} value={providerForm.model} onChange={e => setProviderForm(v => ({ ...v, model: e.target.value }))} placeholder={t('model.model')} />
+          <input style={s.input} type="password" value={providerForm.apiKey} onChange={e => setProviderForm(v => ({ ...v, apiKey: e.target.value }))} placeholder={t('model.apiKey')} />
+          <button style={s.primaryBtn} onClick={saveProviderForm}>{t('model.saveProvider')}</button>
         </div>
       )}
 
       <div ref={transcriptRef} style={s.transcript}>
         {lines.length === 0 ? (
           <div style={s.hint}>
-            <div>agent ready</div>
-            <div>Try asking about this SSH session, or type /sessions.</div>
+            <div>{t('shell.agentReady')}</div>
+            <div>{t('shell.agentReadyHint')}</div>
           </div>
         ) : lines.map(line => (
           <div key={line.id} style={s.line}>
             <span style={roleStyle(line.role)}>{line.role}</span>
             <div style={s.lineBody}>
-              <pre style={s.text}>{line.busy && !line.text ? 'thinking...' : displayLineText(line)}</pre>
+              <pre style={s.text}>{line.busy && !line.text ? thinkingLabel(statusTick, language) : displayLineText(line, language)}</pre>
               {isLongLine(line) && (
                 <button style={s.inlineBtn} onClick={() => toggleLineExpanded(line.id)}>
-                  {line.expanded ? 'collapse' : 'show full'}
+                  {line.expanded ? t('shell.collapse') : t('shell.showFull')}
                 </button>
               )}
             </div>
@@ -584,16 +604,16 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
         ))}
         {showSessions && (
           <div style={s.sessions}>
-            <div style={s.sectionTitle}>sessions</div>
-            {conversations.length === 0 ? <div style={s.hint}>No saved sessions for this server.</div> : conversations.map((item, index) => (
+            <div style={s.sectionTitle}>{t('shell.sessions')}</div>
+            {conversations.length === 0 ? <div style={s.hint}>{t('shell.noSavedSessions')}</div> : conversations.map((item, index) => (
               <button
                 key={item.id}
                 style={{ ...s.sessionItem, ...(index === selectedSession ? s.sessionItemOn : {}) }}
                 onMouseEnter={() => setSelectedSession(index)}
                 onClick={() => selectConversation(item)}
               >
-                <span>{item.title ?? 'Untitled session'}</span>
-                <small>{new Date(item.updatedAt).toLocaleString()} · ~{item.estimatedTokens} tokens</small>
+                <span>{item.title ?? t('shell.untitledSession')}</span>
+                <small>{new Date(item.updatedAt).toLocaleString()} · ~{item.estimatedTokens} {t('shell.tokens')}</small>
               </button>
             ))}
           </div>
@@ -603,15 +623,15 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
           return (
           <div key={approval.id} style={{ ...s.approval, ...(isInteractive ? s.approvalInteractive : {}) }}>
             <div style={s.approvalHeader}>
-              <div style={s.sectionTitle}>{isInteractive ? 'interactive command handoff' : 'exec_command approval'}</div>
-              {isInteractive && <span style={s.interactivePill}>user input required</span>}
+              <div style={s.sectionTitle}>{isInteractive ? t('shell.interactiveHandoff') : t('shell.approval')}</div>
+              {isInteractive && <span style={s.interactivePill}>{t('shell.userInputRequired')}</span>}
             </div>
             <pre style={s.approvalCmd}>$ {approval.cmd}</pre>
             <div style={s.approvalPurpose}>{approval.purpose}</div>
             {isInteractive && (
               <div style={s.interactionTip}>
-                <strong>Tip</strong>
-                <span>{approval.interactionTip || approval.riskReasons?.join(' · ') || 'This command may ask for input or take over the terminal. Continue manually in the main SSH terminal.'}</span>
+                <strong>{t('shell.tip')}</strong>
+                <span>{approval.interactionTip || approval.riskReasons?.join(' · ') || t('shell.interactiveTipFallback')}</span>
               </div>
             )}
             {approval.riskLevel && (
@@ -621,8 +641,8 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
               </div>
             )}
             <div style={s.approvalActions}>
-              <button style={s.denyBtn} onClick={() => denyExec(approval)}>{approval.status === 'blocked' ? 'dismiss' : 'deny'}</button>
-              {approval.status !== 'blocked' && <button style={isInteractive ? s.interactiveApproveBtn : s.approveBtn} onClick={() => approveExec(approval)}>{isInteractive ? 'handoff' : 'approve'}</button>}
+              <button style={s.denyBtn} onClick={() => denyExec(approval)}>{approval.status === 'blocked' ? t('general.dismiss') : t('shell.deny')}</button>
+              {approval.status !== 'blocked' && <button style={isInteractive ? s.interactiveApproveBtn : s.approveBtn} onClick={() => approveExec(approval)}>{isInteractive ? t('shell.handoff') : t('shell.approve')}</button>}
             </div>
           </div>
           )
@@ -630,16 +650,16 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
         {interactiveHandoff && (
           <div style={s.handoffPanel}>
             <div style={s.approvalHeader}>
-              <div style={s.sectionTitle}>waiting for interactive input</div>
-              <span style={s.interactivePill}>manual terminal</span>
+              <div style={s.sectionTitle}>{t('shell.handoffWaiting')}</div>
+              <span style={s.interactivePill}>{t('shell.manualTerminal')}</span>
             </div>
             <pre style={s.approvalCmd}>$ {interactiveHandoff.approval.cmd}</pre>
             <div style={s.approvalPurpose}>
-              Finish the prompts in the main SSH terminal. When the command is done, continue here so Shelly can send the captured result back to the model.
+              {t('shell.handoffWaitingHint')}
             </div>
             <div style={s.approvalActions}>
-              <button style={s.denyBtn} onClick={dismissInteractiveHandoff}>dismiss</button>
-              <button style={s.interactiveApproveBtn} onClick={continueInteractiveHandoff}>continue</button>
+              <button style={s.denyBtn} onClick={dismissInteractiveHandoff}>{t('general.dismiss')}</button>
+              <button style={s.interactiveApproveBtn} onClick={continueInteractiveHandoff}>{t('shell.continue')}</button>
             </div>
           </div>
         )}
@@ -648,11 +668,10 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
       {interactivePrompt && (
         <div style={s.modalBackdrop}>
           <div style={s.modal}>
-            <div style={s.modalTitle}>Interactive command</div>
-            <div style={s.modalWarning}>这是一个需要交互的命令，Shelly Agent 不会介入后续交互流程。</div>
+            <div style={s.modalTitle}>{t('shell.interactiveCommand')}</div>
+            <div style={s.modalWarning}>{t('shell.interactiveModalWarning')}</div>
             <div style={s.modalText}>
-              After approval, the command is sent to the main SSH terminal. Any prompt, password entry,
-              editor screen, or menu choice must be handled by you directly there.
+              {t('shell.interactiveModalText')}
             </div>
             <label style={s.modalCheck}>
               <input
@@ -660,10 +679,10 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
                 checked={interactivePrompt.dontShowAgain}
                 onChange={e => setInteractivePrompt(prev => prev ? { ...prev, dontShowAgain: e.target.checked } : prev)}
               />
-              <span>Don't remind me again</span>
+              <span>{t('shell.savedDontRemind')}</span>
             </label>
             <div style={s.modalActions}>
-              <button style={s.gotItBtn} onClick={confirmInteractivePrompt}>Got it</button>
+              <button style={s.gotItBtn} onClick={confirmInteractivePrompt}>{t('shell.gotIt')}</button>
             </div>
           </div>
         </div>
@@ -671,16 +690,16 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
 
       {notice && <div style={s.notice}>{notice}</div>}
       <div style={s.composer}>
-        <span style={s.prompt}>›</span>
+        <span style={s.prompt}>?</span>
         <input
           style={s.composerInput}
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={onComposerKey}
-          placeholder={width < 300 ? '/sessions' : 'Ask Shelly Agent, /sessions, /new-session, /exec <cmd>'}
+          placeholder={width < 300 ? '/sessions' : t('shell.askPlaceholder')}
           spellCheck={false}
         />
-        <button style={s.sendBtn} onClick={submit} disabled={status === 'streaming'}>{status === 'streaming' ? '...' : 'send'}</button>
+        <button style={s.sendBtn} onClick={submit} disabled={status === 'streaming'}>{status === 'streaming' ? '...' : t('general.send')}</button>
       </div>
     </div>
   )
@@ -694,19 +713,47 @@ function toLine(msg: AiMessage): Line {
   }
 }
 
-function statusLabel(status: string) {
-  const labels: Record<string, string> = {
-    idle: 'idle',
-    saving: 'saving',
-    streaming: 'thinking',
-    waiting_approval: 'approval',
-    executing_tool: 'executing',
-    interactive_handoff: 'handoff',
-    done: 'done',
-    error: 'error',
-    context_warning: 'context',
+function statusLabel(status: string, tick = 0, language: 'en' | 'zh-CN' = 'en') {
+  const labels: Record<string, I18nKey> = {
+    idle: 'status.idle',
+    saving: 'status.saving',
+    streaming: 'status.thinking',
+    waiting_approval: 'status.approval',
+    executing_tool: 'status.executing',
+    interactive_handoff: 'status.handoff',
+    done: 'status.done',
+    error: 'status.error',
+    timeout: 'status.timeout',
+    context_warning: 'status.context',
   }
-  return labels[status] ?? status
+  const label = labels[status] ? tr(language, labels[status]) : status
+  return isWorkingStatus(status) ? `${label}${'.'.repeat(tick)}` : label
+}
+
+function toolResultLabel(runStatus: string, timedOut: boolean, language: 'en' | 'zh-CN' = 'en') {
+  if (timedOut || runStatus === 'timeout') return tr(language, 'shell.captureTimedOut')
+  if (runStatus === 'denied') return tr(language, 'shell.denied')
+  if (runStatus === 'blocked') return tr(language, 'shell.blocked')
+  return tr(language, 'shell.capturedOutput')
+}
+
+function isWorkingStatus(status: string) {
+  return ['saving', 'streaming', 'waiting_approval', 'executing_tool', 'interactive_handoff'].includes(status)
+}
+
+function thinkingLabel(tick: number, language: 'en' | 'zh-CN' = 'en') {
+  return `${tr(language, 'shell.thinking')}${'.'.repeat(tick)}`
+}
+
+function statusDotStyle(status: string, tick: number): React.CSSProperties {
+  if (!isWorkingStatus(status)) return {}
+  const lift = tick % 2 === 0 ? 0 : -2
+  const opacity = tick === 0 ? 0.56 : 1
+  return {
+    opacity,
+    transform: `translateY(${lift}px) scale(${tick === 0 ? 0.82 : 1})`,
+    transition: 'transform 160ms ease, opacity 160ms ease',
+  }
 }
 
 function roleStyle(role: string) {
@@ -720,10 +767,84 @@ function isLongLine(line: Line) {
   return line.text.length > 5000
 }
 
-function displayLineText(line: Line) {
+function displayLineText(line: Line, language: 'en' | 'zh-CN' = 'en') {
   if (line.expanded || !isLongLine(line)) return line.text
   const preview = line.text.slice(0, 5000).trimEnd()
-  return `${preview}\n\n[collapsed ${line.text.length - preview.length} chars]`
+  return `${preview}\n\n[${tr(language, 'shell.collapsedChars').replace('{count}', String(line.text.length - preview.length))}]`
+}
+
+function buildSessionSnapshot(
+  active: Connection,
+  activeServerKey: string,
+  terminalContext?: string | null,
+): SaveAiSessionSnapshotInput {
+  const facts = inferTerminalFacts(terminalContext ?? '', active.username)
+  return {
+    serverKey: activeServerKey,
+    sessionId: active.sessionId ?? null,
+    deviceId: active.id,
+    hostname: facts.hostname ?? active.name,
+    username: facts.username ?? active.username,
+    host: active.host,
+    port: active.port,
+    os: facts.os ?? null,
+    shell: facts.shell ?? null,
+    cwd: facts.cwd ?? null,
+    terminalTitle: facts.terminalTitle ?? active.name,
+  }
+}
+
+function inferTerminalFacts(text: string, fallbackUser: string) {
+  const lines = text
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(cleanTerminalLine)
+    .filter(Boolean)
+  const prompt = [...lines].reverse().find(line => /[\w.-]+@[\w.-]+:.+[#$]\s*$/.test(line))
+  const promptMatch = prompt?.match(/(?:^|\s)([\w.-]+)@([\w.-]+):(.+?)([#$])\s*$/)
+  const username = promptMatch?.[1]
+  const hostname = promptMatch?.[2]
+  const cwd = normalizePromptCwd(promptMatch?.[3], username ?? fallbackUser)
+  return {
+    username,
+    hostname,
+    cwd,
+    shell: inferShell(lines),
+    os: inferOs(lines),
+    terminalTitle: prompt ? prompt.replace(/\s+$/, '') : undefined,
+  }
+}
+
+function cleanTerminalLine(line: string) {
+  return line
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\]0;[^\x07]*\x07/g, '')
+    .trim()
+}
+
+function normalizePromptCwd(cwd: string | undefined, username: string) {
+  if (!cwd) return undefined
+  const trimmed = cwd.trim()
+  if (trimmed === '~') return username === 'root' ? '/root' : `/home/${username}`
+  if (trimmed.startsWith('~/')) {
+    const home = username === 'root' ? '/root' : `/home/${username}`
+    return `${home}/${trimmed.slice(2)}`
+  }
+  return trimmed
+}
+
+function inferShell(lines: string[]) {
+  const shellLine = [...lines].reverse().find(line => /(?:^|[/ ])(?:bash|zsh|fish|sh|dash|ksh)\b/.test(line) && (line.includes('/bin/') || line.startsWith('SHELL=')))
+  const match = shellLine?.match(/(?:SHELL=)?(\/[\w/.-]*(?:bash|zsh|fish|dash|ksh|sh))\b/)
+  return match?.[1]
+}
+
+function inferOs(lines: string[]) {
+  const pretty = [...lines].reverse().find(line => line.includes('PRETTY_NAME='))
+  const prettyMatch = pretty?.match(/PRETTY_NAME="?([^"\n]+)"?/)
+  if (prettyMatch?.[1]) return prettyMatch[1]
+  const osLine = [...lines].reverse().find(line => /(ubuntu|debian|centos|rocky|almalinux|fedora|arch linux|opensuse)/i.test(line))
+  return osLine
 }
 
 function normalizeStreamDelta(existing: string, incoming: string) {
@@ -759,54 +880,54 @@ function interactiveWarningDismissed() {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  root: { position:'relative', height:'100%', display:'flex', flexDirection:'column', minHeight:0, background:'#1e1e1e', fontFamily:'var(--fm)' },
-  empty: { padding:16, color:'#686868', fontSize:11, lineHeight:1.6 },
-  status: { height:32, display:'flex', alignItems:'center', gap:8, padding:'0 10px', borderBottom:'1px solid rgba(255,255,255,0.06)', flexShrink:0 },
-  dot: { width:7, height:7, borderRadius:10, background:'#4ec9b0', flexShrink:0 },
-  statusText: { flex:1, minWidth:0, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'#9d9d9d', fontSize:10 },
-  runState: { color:'#4ec9b0', fontSize:10, textTransform:'uppercase', letterSpacing:'0.04em' },
-  badge: { maxWidth:120, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'#569cd6', fontSize:10 },
-  providerBox: { padding:10, display:'flex', flexDirection:'column', gap:6, borderBottom:'1px solid rgba(255,255,255,0.06)', flexShrink:0 },
-  sectionTitle: { color:'#686868', fontSize:10, textTransform:'uppercase', letterSpacing:'0.08em' },
-  input: { height:26, background:'#252526', color:'#d4d4d4', border:'1px solid rgba(255,255,255,0.08)', borderRadius:3, padding:'0 7px', fontFamily:'var(--fm)', fontSize:11 },
-  primaryBtn: { height:26, border:'none', borderRadius:3, background:'#569cd6', color:'#0b1b24', fontSize:11, cursor:'pointer' },
+  root: { position:'relative', height:'100%', display:'flex', flexDirection:'column', minHeight:0, background:'var(--c0)', fontFamily:'var(--fm)' },
+  empty: { padding:16, color:'var(--t2)', fontSize:'var(--ui-font)', lineHeight:1.6 },
+  status: { height:32, display:'flex', alignItems:'center', gap:8, padding:'0 10px', borderBottom:'1px solid var(--b0)', flexShrink:0 },
+  dot: { width:7, height:7, borderRadius:10, background:'var(--grn)', flexShrink:0 },
+  statusText: { flex:1, minWidth:0, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--t1)', fontSize:'var(--ui-font-sm)' },
+  runState: { color:'var(--grn)', fontSize:'var(--ui-font-sm)', textTransform:'uppercase', letterSpacing:'0.04em' },
+  badge: { maxWidth:120, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--acc)', fontSize:'var(--ui-font-sm)' },
+  providerBox: { padding:10, display:'flex', flexDirection:'column', gap:6, borderBottom:'1px solid var(--b0)', flexShrink:0 },
+  sectionTitle: { color:'var(--t2)', fontSize:'var(--ui-font-sm)', textTransform:'uppercase', letterSpacing:'0.08em' },
+  input: { height:26, background:'var(--c1)', color:'var(--t0)', border:'1px solid var(--b1)', borderRadius:3, padding:'0 7px', fontFamily:'var(--fm)', fontSize:'var(--ui-font)' },
+  primaryBtn: { height:26, border:'none', borderRadius:3, background:'var(--acc)', color:'#0b1b24', fontSize:'var(--ui-font)', cursor:'pointer' },
   transcript: { flex:1, minHeight:0, overflowY:'auto', padding:10 },
-  hint: { color:'#686868', fontSize:11, lineHeight:1.7 },
+  hint: { color:'var(--t2)', fontSize:'var(--ui-font)', lineHeight:1.7 },
   line: { display:'grid', gridTemplateColumns:'68px minmax(0,1fr)', gap:8, alignItems:'start', marginBottom:10 },
-  userRole: { color:'#4ec9b0', fontSize:10, textTransform:'uppercase' },
-  agentRole: { color:'#569cd6', fontSize:10, textTransform:'uppercase' },
-  toolRole: { color:'#ffab40', fontSize:10, textTransform:'uppercase' },
-  guardRole: { color:'#f48771', fontSize:10, textTransform:'uppercase' },
+  userRole: { color:'var(--grn)', fontSize:'var(--ui-font-sm)', textTransform:'uppercase' },
+  agentRole: { color:'var(--acc)', fontSize:'var(--ui-font-sm)', textTransform:'uppercase' },
+  toolRole: { color:'#ffab40', fontSize:'var(--ui-font-sm)', textTransform:'uppercase' },
+  guardRole: { color:'#f48771', fontSize:'var(--ui-font-sm)', textTransform:'uppercase' },
   lineBody: { minWidth:0, display:'flex', flexDirection:'column', alignItems:'flex-start', gap:5 },
-  text: { margin:0, whiteSpace:'pre-wrap', wordBreak:'break-word', color:'#d4d4d4', fontSize:11, lineHeight:1.55, fontFamily:'var(--fm)' },
-  inlineBtn: { border:'1px solid rgba(255,255,255,0.08)', borderRadius:3, background:'#252526', color:'#9d9d9d', fontSize:10, padding:'3px 7px', cursor:'pointer' },
-  sessions: { border:'1px solid rgba(255,255,255,0.08)', background:'#252526', borderRadius:4, padding:6, display:'flex', flexDirection:'column', gap:4 },
-  sessionItem: { display:'flex', flexDirection:'column', alignItems:'stretch', gap:2, textAlign:'left', border:'none', background:'transparent', color:'#d4d4d4', padding:'6px 7px', borderRadius:3, cursor:'pointer', fontFamily:'var(--fm)', fontSize:11 },
+  text: { margin:0, whiteSpace:'pre-wrap', wordBreak:'break-word', color:'var(--t0)', fontSize:'var(--ui-font)', lineHeight:1.55, fontFamily:'var(--fm)' },
+  inlineBtn: { border:'1px solid var(--b1)', borderRadius:3, background:'var(--c1)', color:'var(--t1)', fontSize:'var(--ui-font-sm)', padding:'3px 7px', cursor:'pointer' },
+  sessions: { border:'1px solid var(--b1)', background:'var(--c1)', borderRadius:4, padding:6, display:'flex', flexDirection:'column', gap:4 },
+  sessionItem: { display:'flex', flexDirection:'column', alignItems:'stretch', gap:2, textAlign:'left', border:'none', background:'transparent', color:'var(--t0)', padding:'6px 7px', borderRadius:3, cursor:'pointer', fontFamily:'var(--fm)', fontSize:'var(--ui-font)' },
   sessionItemOn: { background:'rgba(86,156,214,0.18)' },
-  notice: { flexShrink:0, color:'#f0c674', background:'rgba(240,198,116,0.08)', borderTop:'1px solid rgba(240,198,116,0.14)', padding:'6px 10px', fontSize:10, lineHeight:1.5 },
+  notice: { flexShrink:0, color:'#f0c674', background:'rgba(240,198,116,0.08)', borderTop:'1px solid rgba(240,198,116,0.14)', padding:'6px 10px', fontSize:'var(--ui-font-sm)', lineHeight:1.5 },
   approval: { border:'1px solid rgba(244,191,117,0.24)', background:'rgba(244,191,117,0.08)', borderRadius:4, padding:8, marginTop:8, display:'flex', flexDirection:'column', gap:7 },
   handoffPanel: { border:'1px solid rgba(255,171,64,0.34)', background:'rgba(255,171,64,0.09)', borderRadius:4, padding:8, marginTop:8, display:'flex', flexDirection:'column', gap:7 },
   approvalInteractive: { border:'1px solid rgba(255,171,64,0.42)', background:'rgba(255,171,64,0.11)' },
   approvalHeader: { display:'flex', alignItems:'center', justifyContent:'space-between', gap:8 },
   interactivePill: { flexShrink:0, border:'1px solid rgba(255,171,64,0.28)', borderRadius:999, color:'#ffab40', padding:'2px 6px', fontSize:9, textTransform:'uppercase', letterSpacing:'0.04em' },
-  approvalCmd: { margin:0, color:'#d4d4d4', fontSize:11, whiteSpace:'pre-wrap', wordBreak:'break-word', fontFamily:'var(--fm)' },
-  approvalPurpose: { color:'#9d9d9d', fontSize:10, lineHeight:1.5 },
-  risk: { display:'flex', alignItems:'center', gap:7, color:'#f0c674', fontSize:10, lineHeight:1.5 },
-  interactionTip: { border:'1px solid rgba(255,171,64,0.18)', background:'rgba(0,0,0,0.16)', borderRadius:4, padding:'6px 7px', display:'grid', gap:3, color:'#d4d4d4', fontSize:10, lineHeight:1.5 },
+  approvalCmd: { margin:0, color:'var(--t0)', fontSize:'var(--ui-font)', whiteSpace:'pre-wrap', wordBreak:'break-word', fontFamily:'var(--fm)' },
+  approvalPurpose: { color:'var(--t1)', fontSize:'var(--ui-font-sm)', lineHeight:1.5 },
+  risk: { display:'flex', alignItems:'center', gap:7, color:'#f0c674', fontSize:'var(--ui-font-sm)', lineHeight:1.5 },
+  interactionTip: { border:'1px solid rgba(255,171,64,0.18)', background:'rgba(0,0,0,0.16)', borderRadius:4, padding:'6px 7px', display:'grid', gap:3, color:'var(--t0)', fontSize:'var(--ui-font-sm)', lineHeight:1.5 },
   approvalActions: { display:'flex', justifyContent:'flex-end', gap:6 },
-  denyBtn: { border:'1px solid rgba(255,255,255,0.09)', borderRadius:3, background:'transparent', color:'#9d9d9d', fontSize:10, padding:'4px 8px', cursor:'pointer' },
-  approveBtn: { border:'none', borderRadius:3, background:'#569cd6', color:'#0b1b24', fontSize:10, padding:'4px 8px', cursor:'pointer' },
-  interactiveApproveBtn: { border:'none', borderRadius:3, background:'#ffab40', color:'#1e1e1e', fontSize:10, padding:'4px 8px', cursor:'pointer' },
+  denyBtn: { border:'1px solid var(--b1)', borderRadius:3, background:'transparent', color:'var(--t1)', fontSize:'var(--ui-font-sm)', padding:'4px 8px', cursor:'pointer' },
+  approveBtn: { border:'none', borderRadius:3, background:'var(--acc)', color:'#0b1b24', fontSize:'var(--ui-font-sm)', padding:'4px 8px', cursor:'pointer' },
+  interactiveApproveBtn: { border:'none', borderRadius:3, background:'#ffab40', color:'var(--c0)', fontSize:'var(--ui-font-sm)', padding:'4px 8px', cursor:'pointer' },
   modalBackdrop: { position:'absolute', inset:0, zIndex:20, display:'flex', alignItems:'center', justifyContent:'center', padding:12, background:'rgba(0,0,0,0.52)' },
-  modal: { width:'min(420px, 100%)', border:'1px solid rgba(255,171,64,0.38)', background:'#252526', borderRadius:6, boxShadow:'0 18px 48px rgba(0,0,0,0.35)', padding:14, display:'flex', flexDirection:'column', gap:10 },
-  modalTitle: { color:'#ffab40', fontSize:12, textTransform:'uppercase', letterSpacing:'0.06em' },
-  modalWarning: { color:'#d4d4d4', fontSize:12, lineHeight:1.6 },
-  modalText: { color:'#9d9d9d', fontSize:11, lineHeight:1.6 },
-  modalCheck: { display:'flex', alignItems:'center', gap:7, color:'#9d9d9d', fontSize:11 },
+  modal: { width:'min(420px, 100%)', border:'1px solid rgba(255,171,64,0.38)', background:'var(--c1)', borderRadius:6, boxShadow:'0 18px 48px rgba(0,0,0,0.35)', padding:14, display:'flex', flexDirection:'column', gap:10 },
+  modalTitle: { color:'#ffab40', fontSize:'var(--ui-font-md)', textTransform:'uppercase', letterSpacing:'0.06em' },
+  modalWarning: { color:'var(--t0)', fontSize:'var(--ui-font-md)', lineHeight:1.6 },
+  modalText: { color:'var(--t1)', fontSize:'var(--ui-font)', lineHeight:1.6 },
+  modalCheck: { display:'flex', alignItems:'center', gap:7, color:'var(--t1)', fontSize:'var(--ui-font)' },
   modalActions: { display:'flex', justifyContent:'flex-end' },
-  gotItBtn: { border:'none', borderRadius:3, background:'#ffab40', color:'#1e1e1e', fontSize:11, padding:'5px 10px', cursor:'pointer' },
-  composer: { height:36, borderTop:'1px solid rgba(255,255,255,0.06)', display:'flex', alignItems:'center', gap:7, padding:'0 8px', flexShrink:0 },
-  prompt: { color:'#569cd6', fontSize:13 },
-  composerInput: { flex:1, minWidth:0, border:'none', outline:'none', background:'transparent', color:'#d4d4d4', fontFamily:'var(--fm)', fontSize:11 },
-  sendBtn: { border:'none', borderRadius:3, background:'#2d2d2d', color:'#9d9d9d', padding:'4px 7px', fontSize:10, cursor:'pointer' },
+  gotItBtn: { border:'none', borderRadius:3, background:'#ffab40', color:'var(--c0)', fontSize:'var(--ui-font)', padding:'5px 10px', cursor:'pointer' },
+  composer: { height:36, borderTop:'1px solid var(--b0)', display:'flex', alignItems:'center', gap:7, padding:'0 8px', flexShrink:0 },
+  prompt: { color:'var(--acc)', fontSize:'var(--ui-font-lg)' },
+  composerInput: { flex:1, minWidth:0, border:'none', outline:'none', background:'transparent', color:'var(--t0)', fontFamily:'var(--fm)', fontSize:'var(--ui-font)' },
+  sendBtn: { border:'none', borderRadius:3, background:'var(--c2)', color:'var(--t1)', padding:'4px 7px', fontSize:'var(--ui-font-sm)', cursor:'pointer' },
 }

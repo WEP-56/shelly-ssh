@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { DeviceStats } from './lib/ssh'
 
 export interface Connection {
   id: string
@@ -6,9 +7,13 @@ export interface Connection {
   host: string
   port: number
   username: string
+  authMethod?: 'password' | 'privateKey'
+  privateKeyPath?: string | null
   status: 'disconnected' | 'connecting' | 'connected' | 'error'
   sessionId?: string
   rememberPassword?: boolean
+  pinned?: boolean
+  deviceStats?: DeviceStats | null
 }
 
 export interface ConnectDraft {
@@ -17,7 +22,10 @@ export interface ConnectDraft {
   host: string
   port: number
   username: string
+  authMethod?: 'password' | 'privateKey'
+  privateKeyPath?: string | null
   rememberPassword?: boolean
+  pinned?: boolean
 }
 
 export interface CommandHistoryEntry {
@@ -35,13 +43,17 @@ export interface CommandSnippet {
   updatedAt?: number
 }
 
-export type RightDockTab = 'files' | 'history' | 'snippets' | 'agent'
+export type RightDockTab = 'files' | 'history' | 'snippets'
 export type BottomPanelMode = 'powershell' | 'agent'
+export type Language = 'en' | 'zh-CN'
+export type ThemeMode = 'dark' | 'light'
+export type UiFontSize = 'small' | 'medium' | 'large'
 
 interface S {
   conns: Connection[]
   activeId: string | null
   sidebarOpen: boolean
+  sidebarWidth: number
   rightOpen: boolean
   rightTab: RightDockTab
   rightDockWidth: number
@@ -54,21 +66,33 @@ interface S {
   localOpen: boolean
   localHeight: number
   bottomPanelMode: BottomPanelMode
+  language: Language
+  themeMode: ThemeMode
+  uiFontSize: UiFontSize
+  defaultDownloadDir: string
   showSettings: boolean
   setCommandPaletteOpen: (v: boolean) => void
   toggleCommandPalette: () => void
   setConns: (conns: Connection[]) => void
   setCommandHistory: (history: CommandHistoryEntry[]) => void
   setCommandSnippets: (snippets: CommandSnippet[]) => void
-  addCommandHistory: (command: string, connectionName?: string) => void
+  addCommandHistory: (command: string, connectionName?: string, id?: string, lastUsedAt?: number) => void
+  removeCommandHistory: (id: string) => void
+  clearCommandHistory: () => void
   upsertCommandSnippet: (snippet: CommandSnippet) => void
   removeCommandSnippet: (id: string) => void
   openConnectDialog: (draft?: ConnectDraft | null) => void
   setConnectDraft: (draft: ConnectDraft | null) => void
   toggleLocal: () => void
+  setLocalOpen: (v: boolean) => void
   setLocalHeight: (h: number) => void
   setBottomPanelMode: (mode: BottomPanelMode) => void
+  setLanguage: (language: Language) => void
+  setThemeMode: (themeMode: ThemeMode) => void
+  setUiFontSize: (uiFontSize: UiFontSize) => void
+  setDefaultDownloadDir: (path: string) => void
   setShowSettings: (v: boolean) => void
+  setSidebarWidth: (w: number) => void
   setRightDockWidth: (w: number) => void
   setFilePreviewWidth: (w: number) => void
   addConn: (c: Omit<Connection, 'id' | 'status'> & { id?: string; status?: Connection['status'] }) => string
@@ -106,7 +130,7 @@ function writeStringPref(key: string, value: string) {
 }
 
 export const useStore = create<S>(set => ({
-  conns: [], activeId: null, sidebarOpen: true, rightOpen: true, rightTab: 'files',
+  conns: [], activeId: null, sidebarOpen: true, sidebarWidth: readNumberPref('shelly:sidebarWidth', 200), rightOpen: false, rightTab: 'files',
   rightDockWidth: readNumberPref('shelly:rightDockWidth', 280),
   filePreviewWidth: readNumberPref('shelly:filePreviewWidth', 420),
   showConnect: false, connectDraft: null,
@@ -115,18 +139,24 @@ export const useStore = create<S>(set => ({
   commandSnippets: [],
   localOpen: false, localHeight: 220,
   bottomPanelMode: readStringPref<BottomPanelMode>('shelly:bottomPanelMode', 'powershell', ['powershell', 'agent']),
+  language: readStringPref<Language>('shelly:language', 'en', ['en', 'zh-CN']),
+  themeMode: readStringPref<ThemeMode>('shelly:themeMode', 'dark', ['dark', 'light']),
+  uiFontSize: readStringPref<UiFontSize>('shelly:uiFontSize', 'small', ['small', 'medium', 'large']),
+  defaultDownloadDir: typeof localStorage === 'undefined' ? '' : localStorage.getItem('shelly:defaultDownloadDir') ?? '',
   showSettings: false,
   setCommandPaletteOpen: v => set({ commandPaletteOpen: v }),
   toggleCommandPalette: () => set(s => ({ commandPaletteOpen: !s.commandPaletteOpen })),
   setConns: conns => set(s => ({ conns, activeId: s.activeId && conns.some(c => c.id === s.activeId) ? s.activeId : null })),
   setCommandHistory: commandHistory => set({ commandHistory }),
   setCommandSnippets: commandSnippets => set({ commandSnippets }),
-  addCommandHistory: (command, connectionName) => set(s => ({
+  addCommandHistory: (command, connectionName, id, lastUsedAt) => set(s => ({
     commandHistory: [
-      { id: `h${++historyUid}`, command, connectionName, lastUsedAt: Date.now() },
+      { id: id ?? `h${++historyUid}`, command, connectionName, lastUsedAt: lastUsedAt ?? Date.now() },
       ...s.commandHistory.filter(h => h.command !== command),
     ].slice(0, 100),
   })),
+  removeCommandHistory: id => set(s => ({ commandHistory: s.commandHistory.filter(item => item.id !== id) })),
+  clearCommandHistory: () => set({ commandHistory: [] }),
   upsertCommandSnippet: snippet => set(s => ({
     commandSnippets: [
       snippet,
@@ -137,12 +167,34 @@ export const useStore = create<S>(set => ({
   openConnectDialog: draft => set({ connectDraft: draft ?? null, showConnect: true }),
   setConnectDraft: connectDraft => set({ connectDraft }),
   toggleLocal: () => set(s => ({ localOpen: !s.localOpen })),
+  setLocalOpen: localOpen => set({ localOpen }),
   setLocalHeight: h => set({ localHeight: h }),
   setBottomPanelMode: mode => set(() => {
     writeStringPref('shelly:bottomPanelMode', mode)
     return { bottomPanelMode: mode }
   }),
+  setLanguage: language => set(() => {
+    writeStringPref('shelly:language', language)
+    return { language }
+  }),
+  setThemeMode: themeMode => set(() => {
+    writeStringPref('shelly:themeMode', themeMode)
+    return { themeMode }
+  }),
+  setUiFontSize: uiFontSize => set(() => {
+    writeStringPref('shelly:uiFontSize', uiFontSize)
+    return { uiFontSize }
+  }),
+  setDefaultDownloadDir: defaultDownloadDir => set(() => {
+    writeStringPref('shelly:defaultDownloadDir', defaultDownloadDir)
+    return { defaultDownloadDir }
+  }),
   setShowSettings: showSettings => set({ showSettings }),
+  setSidebarWidth: w => set(() => {
+    const sidebarWidth = Math.max(150, Math.min(360, w))
+    writeNumberPref('shelly:sidebarWidth', sidebarWidth)
+    return { sidebarWidth }
+  }),
   setRightDockWidth: w => set(() => {
     const rightDockWidth = Math.max(220, Math.min(520, w))
     writeNumberPref('shelly:rightDockWidth', rightDockWidth)

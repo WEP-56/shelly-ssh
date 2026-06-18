@@ -1,10 +1,15 @@
-example
-node_modules
-.claude
+# Local reference material
+example/
+image/
+.claude/
+
+# Dependencies
+node_modules/
 
 # Frontend build
 dist/
 .vite/
+node_modules/.vite/
 
 # Rust
 src-tauri/target/
@@ -16,6 +21,11 @@ src-tauri/gen/
 *.deb
 *.rpm
 *.msi
+*.msix
+*.AppImage
+*.exe
+*.zip
+*.tar.gz
 
 # IDE
 .vscode/settings.json
@@ -28,9 +38,16 @@ Thumbs.db
 # Secrets
 .env
 .env.local
+.env.*.local
 
 # Temp
 gen_index.py
-docs/development-plan.md
+shelly_v3.html
+*.log
+*.tmp
+
+# Local development notes
 docs/agent-terminal-implementation.md
-docs/handover.md
+docs/development-plan.md
+docs/phase3-ops-test-matrix.md
+docs
