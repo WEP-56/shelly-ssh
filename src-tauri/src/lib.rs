@@ -3,10 +3,12 @@ mod db;
 mod file_jobs;
 mod local_term;
 mod ssh;
+mod update;
 use ai::{
     ai_approve_tool, ai_complete_interactive_tool, ai_deny_tool, ai_execute_approved_tool,
     ai_read_terminal, ai_send_message,
 };
+use base64::{engine::general_purpose, Engine as _};
 use db::{
     db_add_command_history, db_bind_ai_conversation_session, db_clear_command_history,
     db_create_ai_conversation, db_delete_ai_conversation, db_delete_ai_provider,
@@ -28,9 +30,47 @@ use ssh::{
     ssh_collect_device_stats, ssh_connect, ssh_disconnect, ssh_host_key_respond, ssh_input,
     ssh_list_known_hosts, ssh_remove_known_host, ssh_resize, HostKeyPromptStore, SessionStore,
 };
+use update::{
+    open_github_repository, update_check, update_current_version, update_download,
+    update_install_and_exit,
+};
+use std::path::Path;
 use std::{collections::HashMap, sync::Arc};
 use tauri::Manager;
 use tokio::sync::{Mutex, Semaphore};
+
+const THEME_BACKGROUND_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    let path = Path::new(&path);
+    let metadata =
+        std::fs::metadata(path).map_err(|err| format!("Failed to read image metadata: {err}"))?;
+    if !metadata.is_file() {
+        return Err("Background image path is not a file".into());
+    }
+    if metadata.len() > THEME_BACKGROUND_MAX_BYTES {
+        return Err("Background image is larger than 25 MB".into());
+    }
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => return Err("Unsupported background image type".into()),
+    };
+    let bytes = std::fs::read(path).map_err(|err| format!("Failed to read image: {err}"))?;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
 
 pub fn run() {
     tauri::Builder::default()
@@ -107,6 +147,12 @@ pub fn run() {
             file_queue_create_file,
             file_list_jobs,
             file_cancel_job,
+            read_image_data_url,
+            update_current_version,
+            update_check,
+            update_download,
+            update_install_and_exit,
+            open_github_repository,
         ])
         .run(tauri::generate_context!())
         .expect("error running shelly");

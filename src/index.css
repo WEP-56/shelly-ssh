@@ -1,5 +1,6 @@
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
+  color-scheme:dark;
   --fm:"JetBrains Mono","Fira Code","Cascadia Code",monospace;
   --fs:-apple-system,"Segoe UI",sans-serif;
   --c0:#1e1e1e;
@@ -37,6 +38,66 @@
   --t1:#4d5560;
   --t2:#6e7781;
   --t3:#8c959f;
+  --acc:#0969da;
+  --red:#cf222e;
+  --grn:#1a7f37;
+}
+:root[data-theme="vscode"]{
+  color-scheme:dark;
+  --c0:#181818;
+  --c1:#1f1f1f;
+  --c2:#252526;
+  --c3:#2d2d30;
+  --c4:#3e3e42;
+  --b0:rgba(255,255,255,0.055);
+  --b1:rgba(255,255,255,0.10);
+  --b2:rgba(255,255,255,0.16);
+  --t0:#cccccc;
+  --t1:#a6a6a6;
+  --t2:#7a7a7a;
+  --t3:#585858;
+  --acc:#007acc;
+  --red:#f14c4c;
+  --grn:#89d185;
+}
+:root[data-theme="codex"]{
+  color-scheme:dark;
+  --c0:#0d0f0e;
+  --c1:#151816;
+  --c2:#1d221f;
+  --c3:#27312b;
+  --c4:#354139;
+  --b0:rgba(230,236,232,0.055);
+  --b1:rgba(230,236,232,0.10);
+  --b2:rgba(230,236,232,0.16);
+  --t0:#e6ece8;
+  --t1:#b5c2bc;
+  --t2:#7c8b84;
+  --t3:#536259;
+  --acc:#30d5a0;
+  --red:#ff6b6b;
+  --grn:#7ee787;
+}
+:root[data-theme="claude"]{
+  color-scheme:dark;
+  --c0:#1b1917;
+  --c1:#24211d;
+  --c2:#2e2924;
+  --c3:#3a332b;
+  --c4:#4a4035;
+  --b0:rgba(237,230,220,0.055);
+  --b1:rgba(237,230,220,0.10);
+  --b2:rgba(237,230,220,0.16);
+  --t0:#ede6dc;
+  --t1:#c8bdae;
+  --t2:#978c7d;
+  --t3:#6f6558;
+  --acc:#d97745;
+  --red:#f07068;
+  --grn:#7fb685;
+}
+:root[data-theme="custom"]{
+  color-scheme:dark;
 }
 :root[data-ui-font-size="medium"]{
   --ui-font:12px;
@@ -50,13 +111,22 @@
   --ui-font-md:14px;
   --ui-font-lg:15px;
 }
-html,body,#root{width:100%;height:100%;overflow:hidden;background:var(--c0);font-family:var(--fm)}
-html[data-theme="light"] #root input::placeholder,
-html[data-theme="light"] #root textarea::placeholder{
+html,body,#root{
+  width:100%;
+  height:100%;
+  overflow:hidden;
+  background-color:var(--c0);
+  background-size:cover;
+  background-position:center;
+  background-repeat:no-repeat;
+  font-family:var(--fm);
+}
+html[data-color-scheme="light"] #root input::placeholder,
+html[data-color-scheme="light"] #root textarea::placeholder{
   color:var(--t3)!important;
 }
-html[data-theme="light"] #root button:disabled,
-html[data-theme="light"] #root input:disabled{
+html[data-color-scheme="light"] #root button:disabled,
+html[data-color-scheme="light"] #root input:disabled{
   color:var(--t3)!important;
 }
 body{font-size:var(--ui-font)}

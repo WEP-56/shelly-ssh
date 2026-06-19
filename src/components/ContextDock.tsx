@@ -776,8 +776,12 @@ function FilesPanel({ active }: { active: Connection | undefined }) {
 
         {deleteConfirm && (
           <ConfirmDialog
-            title={t('general.delete')}
-            message={`Delete ${deleteConfirm.entry.name}?`}
+            title={t('dock.deleteConfirmTitle')}
+            message={[
+              t(deleteConfirm.entry.isDir ? 'dock.deleteFolderConfirm' : 'dock.deleteFileConfirm'),
+              deleteConfirm.entry.path,
+              active ? `${active.name} · ${active.username}@${active.host}` : '',
+            ].filter(Boolean).join('\n\n')}
             primaryLabel={t('general.delete')}
             danger
             onCancel={() => setDeleteConfirm(null)}

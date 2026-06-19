@@ -9,11 +9,18 @@ export interface ConnectOpts {
   authMethod?: 'password' | 'privateKey'
   privateKeyPath?: string | null
   passphrase?: string
+  connectTimeoutSecs?: number
+  keepaliveEnabled?: boolean
+  keepaliveIntervalSecs?: number
+  keepaliveMaxCount?: number
+  unknownHostKeyPolicy?: 'prompt' | 'reject'
+  strictHostKeyChecking?: boolean
 }
 export interface SshDataEvent { id: string; data: number[] }
 export interface SshClosedEvent { id: string; reason: string }
 export interface SshHostKeyPromptEvent {
   promptId: string
+  reason: 'unknown' | 'changed'
   host: string
   port: number
   algorithm: string

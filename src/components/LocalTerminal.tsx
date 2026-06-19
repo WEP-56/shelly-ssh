@@ -3,22 +3,46 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { localStart, localInput, localResize, onLocalData, onLocalClosed } from '../lib/local'
+import { useStore, type CustomTheme, type TerminalSettings, type ThemeMode } from '../store'
+import { terminalPalette } from '../lib/theme'
+
+function terminalOptions(settings: TerminalSettings, themeMode: ThemeMode, customTheme?: CustomTheme | null) {
+  const palette = terminalPalette(themeMode, customTheme)
+  return {
+    theme: {
+      background: palette.localBackground,
+      foreground: palette.foreground,
+      cursor: palette.cursor,
+      selectionBackground: palette.selectionBackground,
+    },
+    fontFamily: settings.fontFamily,
+    fontSize: settings.fontSize,
+    lineHeight: settings.lineHeight,
+    cursorStyle: settings.cursorStyle,
+    cursorBlink: settings.cursorBlink,
+    scrollback: settings.scrollback,
+    bellStyle: settings.bell ? 'sound' as const : 'none' as const,
+    rightClickSelectsWord: settings.rightClickSelectsWord,
+  }
+}
 
 export function LocalTerminal({ height }: { height: number }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef      = useRef<Terminal | null>(null)
   const fitRef       = useRef<FitAddon | null>(null)
+  const copiedSelectionRef = useRef('')
   const [sessionId, setSessionId] = useState<string | null>(null)
+  const terminalSettings = useStore(s => s.terminalSettings)
+  const themeMode = useStore(s => s.themeMode)
+  const customTheme = useStore(s => s.customThemes.find(theme => theme.id === s.themeMode) ?? null)
+  const palette = terminalPalette(themeMode, customTheme)
 
   // mount terminal
   useEffect(() => {
     if (!containerRef.current) return
-    const term = new Terminal({
-      theme: { background:'#141414', foreground:'#d4d4d4', cursor:'#569cd6',
-               selectionBackground:'rgba(86,156,214,0.25)' },
-      fontFamily: '"JetBrains Mono","Cascadia Code",monospace',
-      fontSize: 13, lineHeight: 1.5, cursorBlink: true,
-    })
+    const state = useStore.getState()
+    const customTheme = state.customThemes.find(theme => theme.id === state.themeMode) ?? null
+    const term = new Terminal(terminalOptions(state.terminalSettings, state.themeMode, customTheme))
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.loadAddon(new WebLinksAddon())
@@ -36,6 +60,43 @@ export function LocalTerminal({ height }: { height: number }) {
 
     return () => { ro.disconnect(); term.dispose() }
   }, [])
+
+  useEffect(() => {
+    const term = termRef.current
+    if (!term) return
+    term.options = terminalOptions(terminalSettings, themeMode, customTheme)
+    requestAnimationFrame(() => fitRef.current?.fit())
+  }, [terminalSettings, themeMode, customTheme])
+
+  useEffect(() => {
+    const term = termRef.current
+    if (!term) return
+    const disposable = term.onSelectionChange(() => {
+      if (!terminalSettings.copyOnSelect || !term.hasSelection()) return
+      const text = term.getSelection()
+      if (!text || text === copiedSelectionRef.current) return
+      copiedSelectionRef.current = text
+      navigator.clipboard?.writeText(text).catch(err => console.warn('[local-terminal] copy selection failed', err))
+    })
+    return () => disposable.dispose()
+  }, [terminalSettings.copyOnSelect])
+
+  useEffect(() => {
+    const el = containerRef.current
+    const term = termRef.current
+    if (!el || !term) return
+    const onContextMenu = (event: MouseEvent) => {
+      if (!terminalSettings.rightClickPaste) return
+      event.preventDefault()
+      navigator.clipboard?.readText()
+        .then(text => {
+          if (text) term.paste(text)
+        })
+        .catch(err => console.warn('[local-terminal] paste failed', err))
+    }
+    el.addEventListener('contextmenu', onContextMenu)
+    return () => el.removeEventListener('contextmenu', onContextMenu)
+  }, [terminalSettings.rightClickPaste])
 
   // re-fit when height changes
   useEffect(() => { fitRef.current?.fit() }, [height])
@@ -61,7 +122,7 @@ export function LocalTerminal({ height }: { height: number }) {
   }, [sessionId])
 
   return (
-    <div style={{ width:'100%', height:'100%', padding:'6px 10px', background:'#141414', boxSizing:'border-box' }}>
+    <div style={{ width:'100%', height:'100%', padding:`${terminalSettings.paddingY}px ${terminalSettings.paddingX}px`, background:palette.localBackground, boxSizing:'border-box' }}>
       <div ref={containerRef} style={{ width:'100%', height:'100%' }} />
     </div>
   )

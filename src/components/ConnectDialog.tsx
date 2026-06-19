@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
-import { useStore } from '../store'
+import { useStore, type AuthMethod, type ConnectionSettings } from '../store'
 import { onSshHostKeyPrompt, sshConnect, sshHostKeyRespond } from '../lib/ssh'
 import { deleteDevicePassword, getDevicePassword, saveDevice, saveDevicePassword, updateDeviceSession } from '../lib/db'
 import { useI18n } from '../i18n'
@@ -11,14 +11,29 @@ if (startupLogs) {
   console.info(`[startup] ConnectDialog module loaded at ${Math.round(performance.now())}ms`)
 }
 
+function resolveDefaultAuthMethod(settings: ConnectionSettings): AuthMethod {
+  return settings.defaultAuthMethod === 'lastUsed' ? settings.lastAuthMethod : settings.defaultAuthMethod
+}
+
 export function ConnectDialog() {
   const { language, t } = useI18n()
+  const {
+    addConn,
+    patchConn,
+    setActive,
+    setShowConnect,
+    connectDraft,
+    connectionSettings,
+    patchConnectionSettings,
+    setRightOpen,
+    setRightTab,
+  } = useStore(s => s)
   const [form, setForm] = useState({
     name: '',
     host: '',
     port: '22',
     username: '',
-    authMethod: 'password' as 'password' | 'privateKey',
+    authMethod: 'password' as AuthMethod,
     password: '',
     privateKeyPath: '',
     passphrase: '',
@@ -28,30 +43,30 @@ export function ConnectDialog() {
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
-  const { addConn, patchConn, setActive, setShowConnect, connectDraft } = useStore(s => s)
 
   useEffect(() => {
     let unlisten: (() => void) | null = null
     onSshHostKeyPrompt(prompt => {
+      const changed = prompt.reason === 'changed'
       const message = language === 'zh-CN'
         ? [
-            `首次连接 ${prompt.host}:${prompt.port}。`,
+            changed ? `${prompt.host}:${prompt.port} 的 Host Key 已变化。` : `首次连接 ${prompt.host}:${prompt.port}。`,
             '',
-            'Shelly 尚未信任此服务器 host key。',
+            changed ? 'Shelly 检测到服务器 Host Key 与已保存记录不同。只有在你确认服务器密钥确实已变更时才继续。' : 'Shelly 尚未信任此服务器 Host Key。',
             `算法：${prompt.algorithm}`,
             `指纹：${prompt.fingerprint}`,
             '',
-            `确认后会写入：${prompt.knownHostsPath}`,
+            changed ? `确认后会更新：${prompt.knownHostsPath}` : `确认后会写入：${prompt.knownHostsPath}`,
             '仅在你确认这是目标服务器时继续。',
           ].join('\n')
         : [
-            `First connection to ${prompt.host}:${prompt.port}.`,
+            changed ? `Host Key changed for ${prompt.host}:${prompt.port}.` : `First connection to ${prompt.host}:${prompt.port}.`,
             '',
-            'Shelly does not trust this server host key yet.',
+            changed ? 'Shelly detected a different server Host Key. Continue only if you intentionally changed this server key.' : 'Shelly does not trust this server Host Key yet.',
             `Algorithm: ${prompt.algorithm}`,
             `Fingerprint: ${prompt.fingerprint}`,
             '',
-            `Accepting writes it to: ${prompt.knownHostsPath}`,
+            changed ? `Accepting updates: ${prompt.knownHostsPath}` : `Accepting writes it to: ${prompt.knownHostsPath}`,
             'Continue only if this is the server you expect.',
           ].join('\n')
       const accept = window.confirm(message)
@@ -67,7 +82,7 @@ export function ConnectDialog() {
       setForm({
         name: connectDraft.name,
         host: connectDraft.host,
-        port: String(connectDraft.port || 22),
+        port: String(connectDraft.port || connectionSettings.defaultPort),
         username: connectDraft.username,
         authMethod: connectDraft.authMethod ?? 'password',
         password: '',
@@ -94,11 +109,28 @@ export function ConnectDialog() {
         if (!connectDraft.rememberPassword) passwordRef.current?.focus()
       })
     } else {
-      setForm({ name: '', host: '', port: '22', username: '', authMethod: 'password', password: '', privateKeyPath: '', passphrase: '', rememberPassword: false })
+      const authMethod = resolveDefaultAuthMethod(connectionSettings)
+      setForm({
+        name: '',
+        host: '',
+        port: String(connectionSettings.defaultPort),
+        username: '',
+        authMethod,
+        password: '',
+        privateKeyPath: authMethod === 'privateKey' ? connectionSettings.defaultPrivateKeyPath : '',
+        passphrase: '',
+        rememberPassword: false,
+      })
       setHasSavedPassword(false)
     }
     setErr('')
-  }, [connectDraft])
+  }, [
+    connectDraft,
+    connectionSettings.defaultPort,
+    connectionSettings.defaultAuthMethod,
+    connectionSettings.lastAuthMethod,
+    connectionSettings.defaultPrivateKeyPath,
+  ])
 
   const f = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm(v => ({ ...v, [k]: e.target.value }))
@@ -128,7 +160,7 @@ export function ConnectDialog() {
         id: connectDraft?.id,
         name: form.name || form.host,
         host: form.host,
-        port: +form.port || 22,
+        port: +form.port || connectionSettings.defaultPort,
         username: form.username,
         authMethod: form.authMethod,
         privateKeyPath: form.authMethod === 'privateKey' ? form.privateKeyPath.trim() : null,
@@ -148,13 +180,20 @@ export function ConnectDialog() {
       patchConn(id, { status: 'connecting' })
       const sessionId = await sshConnect({
         host: form.host,
-        port: +form.port || 22,
+        port: +form.port || connectionSettings.defaultPort,
         username: form.username,
         authMethod: form.authMethod,
         password: form.authMethod === 'password' ? password : undefined,
         privateKeyPath: form.authMethod === 'privateKey' ? form.privateKeyPath.trim() : undefined,
         passphrase: form.authMethod === 'privateKey' ? form.passphrase : undefined,
+        connectTimeoutSecs: connectionSettings.connectTimeoutSecs,
+        keepaliveEnabled: connectionSettings.keepaliveEnabled,
+        keepaliveIntervalSecs: connectionSettings.keepaliveIntervalSecs,
+        keepaliveMaxCount: connectionSettings.keepaliveMaxCount,
+        unknownHostKeyPolicy: connectionSettings.unknownHostKeyPolicy,
+        strictHostKeyChecking: connectionSettings.strictHostKeyChecking,
       })
+      patchConnectionSettings({ lastAuthMethod: form.authMethod })
       if (form.authMethod === 'password' && form.rememberPassword) {
         await saveDevicePassword(id, password)
       } else {
@@ -163,6 +202,10 @@ export function ConnectDialog() {
       await updateDeviceSession(id, sessionId)
       patchConn(id, { status: 'connected', sessionId })
       setActive(id)
+      if (connectionSettings.postConnectAction === 'files' || connectionSettings.postConnectAction === 'terminalFiles') {
+        setRightTab('files')
+        setRightOpen(true)
+      }
       setShowConnect(false)
     } catch (e: any) {
       if (id) {
@@ -194,7 +237,20 @@ export function ConnectDialog() {
           </label>
           <label style={S.row}>
             <span style={S.lbl}>{t('connect.auth')}</span>
-            <select style={S.inp} value={form.authMethod} onChange={e => setForm(v => ({ ...v, authMethod: e.target.value as 'password' | 'privateKey' }))}>
+            <select
+              style={S.inp}
+              value={form.authMethod}
+              onChange={e => {
+                const authMethod = e.target.value as AuthMethod
+                setForm(v => ({
+                  ...v,
+                  authMethod,
+                  privateKeyPath: authMethod === 'privateKey' && !v.privateKeyPath
+                    ? connectionSettings.defaultPrivateKeyPath
+                    : v.privateKeyPath,
+                }))
+              }}
+            >
               <option value="password">{t('connect.password')}</option>
               <option value="privateKey">{t('connect.privateKey')}</option>
             </select>

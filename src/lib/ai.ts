@@ -188,6 +188,9 @@ export const createAiConversation = (input: CreateAiConversationInput): Promise<
 export const getAiConversation = (id: string): Promise<AiConversation> =>
   invoke('db_get_ai_conversation', { id })
 
+export const deleteAiConversation = (id: string): Promise<void> =>
+  invoke('db_delete_ai_conversation', { id })
+
 export const listAiMessages = (conversationId: string): Promise<AiMessage[]> =>
   invoke('db_list_ai_messages', { conversationId })
 

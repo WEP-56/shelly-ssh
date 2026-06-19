@@ -42,6 +42,7 @@ pub struct SshClosedEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SshHostKeyPromptEvent {
     pub prompt_id: String,
+    pub reason: String,
     pub host: String,
     pub port: u16,
     pub algorithm: String,
@@ -88,6 +89,8 @@ pub struct ShellyHandler {
     app: AppHandle,
     host_key_prompts: HostKeyPromptStore,
     known_hosts_path: PathBuf,
+    unknown_host_key_policy: String,
+    strict_host_key_checking: bool,
 }
 
 #[async_trait]
@@ -103,6 +106,9 @@ impl client::Handler for ShellyHandler {
         ) {
             Ok(true) => Ok(true),
             Ok(false) => {
+                if self.unknown_host_key_policy == "reject" {
+                    return Ok(false);
+                }
                 let prompt_id = Uuid::new_v4().to_string();
                 let (tx, rx) = oneshot::channel();
                 self.host_key_prompts
@@ -112,6 +118,7 @@ impl client::Handler for ShellyHandler {
 
                 let event = SshHostKeyPromptEvent {
                     prompt_id: prompt_id.clone(),
+                    reason: "unknown".into(),
                     host: self.host.clone(),
                     port: self.port,
                     algorithm: key.algorithm().as_str().to_string(),
@@ -142,13 +149,65 @@ impl client::Handler for ShellyHandler {
                 Ok(true)
             }
             Err(err) => {
+                if self.strict_host_key_checking {
+                    eprintln!(
+                        "host key check failed for {}:{} at {}: {err}",
+                        self.host,
+                        self.port,
+                        self.known_hosts_path.display()
+                    );
+                    return Ok(false);
+                }
+                let prompt_id = Uuid::new_v4().to_string();
+                let (tx, rx) = oneshot::channel();
+                self.host_key_prompts
+                    .lock()
+                    .await
+                    .insert(prompt_id.clone(), tx);
+
+                let event = SshHostKeyPromptEvent {
+                    prompt_id: prompt_id.clone(),
+                    reason: "changed".into(),
+                    host: self.host.clone(),
+                    port: self.port,
+                    algorithm: key.algorithm().as_str().to_string(),
+                    fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                    known_hosts_path: self.known_hosts_path.display().to_string(),
+                };
+                let _ = self.app.emit("ssh-host-key-prompt", event);
+
+                let accepted = timeout(Duration::from_secs(HOST_KEY_PROMPT_TIMEOUT_SECS), rx)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(false);
+                self.host_key_prompts.lock().await.remove(&prompt_id);
+
+                if !accepted {
+                    return Ok(false);
+                }
+                if let Err(remove_err) =
+                    remove_known_host_entries(&self.host, self.port, &self.known_hosts_path)
+                {
+                    eprintln!("failed to remove changed known_hosts entry: {remove_err}");
+                    return Ok(false);
+                }
+                if let Err(learn_err) = known_hosts::learn_known_hosts_path(
+                    &self.host,
+                    self.port,
+                    key,
+                    &self.known_hosts_path,
+                ) {
+                    eprintln!("failed to write changed known_hosts entry: {learn_err}");
+                    return Ok(false);
+                }
                 eprintln!(
-                    "host key check failed for {}:{} at {}: {err}",
+                    "host key changed for {}:{} at {}; user accepted replacement: {err}",
                     self.host,
                     self.port,
                     self.known_hosts_path.display()
                 );
-                Ok(false)
+                Ok(true)
             }
         }
     }
@@ -163,17 +222,34 @@ pub async fn ssh_connect(
     auth_method: Option<String>,
     private_key_path: Option<String>,
     passphrase: Option<String>,
+    connect_timeout_secs: Option<u64>,
+    keepalive_enabled: Option<bool>,
+    keepalive_interval_secs: Option<u64>,
+    keepalive_max_count: Option<u32>,
+    unknown_host_key_policy: Option<String>,
+    strict_host_key_checking: Option<bool>,
     sessions: State<'_, SessionStore>,
     host_key_prompts: State<'_, HostKeyPromptStore>,
     app: AppHandle,
 ) -> Result<String, String> {
+    let connect_timeout_secs = connect_timeout_secs
+        .unwrap_or(SSH_CONNECT_TIMEOUT_SECS)
+        .clamp(3, 120);
+    let keepalive_interval = keepalive_enabled.unwrap_or(true).then(|| {
+        Duration::from_secs(keepalive_interval_secs.unwrap_or(30).clamp(5, 300))
+    });
+    let keepalive_max = keepalive_max_count.unwrap_or(3).clamp(1, 20) as usize;
+    let unknown_host_key_policy = match unknown_host_key_policy.as_deref() {
+        Some("reject") => "reject".to_string(),
+        _ => "prompt".to_string(),
+    };
     let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(30)),
-        keepalive_max: 3,
+        keepalive_interval,
+        keepalive_max,
         ..Default::default()
     });
     let mut handle = timeout(
-        Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
+        Duration::from_secs(connect_timeout_secs),
         client::connect(
             config,
             (host.as_str(), port),
@@ -183,11 +259,13 @@ pub async fn ssh_connect(
                 app: app.clone(),
                 host_key_prompts: host_key_prompts.inner().clone(),
                 known_hosts_path: known_hosts_path(),
+                unknown_host_key_policy,
+                strict_host_key_checking: strict_host_key_checking.unwrap_or(true),
             },
         ),
     )
     .await
-    .map_err(|_| format!("Connection timed out after {SSH_CONNECT_TIMEOUT_SECS}s"))?
+    .map_err(|_| format!("Connection timed out after {connect_timeout_secs}s"))?
     .map_err(format_ssh_error)?;
 
     let method = auth_method.unwrap_or_else(|| "password".into());
@@ -199,11 +277,11 @@ pub async fn ssh_connect(
         let key = load_secret_key(key_path, passphrase.as_deref())
             .map_err(|e| format!("Failed to load private key: {e}"))?;
         timeout(
-            Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
+            Duration::from_secs(connect_timeout_secs),
             handle.authenticate_publickey(&username, Arc::new(key)),
         )
         .await
-        .map_err(|_| format!("Authentication timed out after {SSH_CONNECT_TIMEOUT_SECS}s"))?
+        .map_err(|_| format!("Authentication timed out after {connect_timeout_secs}s"))?
         .map_err(format_ssh_error)?
     } else {
         let password = password
@@ -211,11 +289,11 @@ pub async fn ssh_connect(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "Password is required".to_string())?;
         timeout(
-            Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
+            Duration::from_secs(connect_timeout_secs),
             handle.authenticate_password(&username, password),
         )
         .await
-        .map_err(|_| format!("Authentication timed out after {SSH_CONNECT_TIMEOUT_SECS}s"))?
+        .map_err(|_| format!("Authentication timed out after {connect_timeout_secs}s"))?
         .map_err(format_ssh_error)?
     };
     if !ok {
@@ -438,6 +516,10 @@ pub fn ssh_list_known_hosts(
 #[tauri::command]
 pub fn ssh_remove_known_host(host: String, port: u16) -> Result<usize, String> {
     let path = known_hosts_path();
+    remove_known_host_entries(&host, port, &path)
+}
+
+fn remove_known_host_entries(host: &str, port: u16, path: &PathBuf) -> Result<usize, String> {
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -449,7 +531,7 @@ pub fn ssh_remove_known_host(host: String, port: u16) -> Result<usize, String> {
         let hosts = known_host_hosts_field(line);
         if hosts
             .as_deref()
-            .map(|hosts| known_host_hosts_match(hosts, &host, port))
+            .map(|hosts| known_host_hosts_match(hosts, host, port))
             .unwrap_or(false)
         {
             removed += 1;

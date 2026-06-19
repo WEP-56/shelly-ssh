@@ -14,6 +14,7 @@ export function Sidebar() {
   const [menu, setMenu] = useState<{ x: number; y: number; device?: Connection } | null>(null)
   const [hostKeyPanel, setHostKeyPanel] = useState<{ device: Connection; entries: KnownHostEntry[]; error?: string } | null>(null)
   const [devicePanel, setDevicePanel] = useState<Connection | null>(null)
+  const [deleteDeviceConfirm, setDeleteDeviceConfirm] = useState<Connection | null>(null)
   const { conns, activeId, sidebarOpen, sidebarWidth, setActive, openConnectDialog, removeConn, patchConn, setShowSettings } = useStore(s => s)
   const selectedDevicePanel = devicePanel ? conns.find(c => c.id === devicePanel.id) ?? devicePanel : null
 
@@ -45,9 +46,9 @@ export function Sidebar() {
   }
 
   const disconnectDevice = async (c: Connection) => {
+    patchConn(c.id, { status: 'disconnected', sessionId: undefined, deviceStats: null })
     if (c.sessionId) await sshDisconnect(c.sessionId)
     await updateDeviceSession(c.id, null).catch(() => undefined)
-    patchConn(c.id, { status: 'disconnected', sessionId: undefined, deviceStats: null })
   }
 
   const disconnect = async (c: Connection, e: React.MouseEvent) => {
@@ -61,9 +62,13 @@ export function Sidebar() {
     removeConn(c.id)
   }
 
+  const askRemoveDevice = (c: Connection) => {
+    setDeleteDeviceConfirm(c)
+  }
+
   const removeDevice = async (c: Connection, e: React.MouseEvent) => {
     e.stopPropagation()
-    await removeDeviceRecord(c)
+    askRemoveDevice(c)
   }
 
   const editDevice = (c: Connection) => openConnectDialog({
@@ -177,7 +182,7 @@ export function Sidebar() {
                 {menuItem('ti-pencil', t('devices.edit'), () => editDevice(menu.device!))}
                 {menuItem('ti-shield-lock', t('devices.hostKey'), () => openHostKeys(menu.device!))}
                 <div style={s.menuSep} />
-                {menuItem('ti-trash', t('devices.remove'), () => removeDeviceRecord(menu.device!), true)}
+                {menuItem('ti-trash', t('devices.remove'), () => askRemoveDevice(menu.device!), true)}
               </>
             ) : (
               <>
@@ -230,6 +235,30 @@ export function Sidebar() {
               <div style={s.modalActions}>
                 <button style={s.menuBtn} onClick={() => setDevicePanel(null)}>{t('general.close')}</button>
                 <button style={s.menuBtn} onClick={() => { editDevice(selectedDevicePanel); setDevicePanel(null) }}>{t('devices.edit')}</button>
+              </div>
+            </div>
+          </div>
+        )}
+        {deleteDeviceConfirm && (
+          <div style={s.modalOverlay} onMouseDown={() => setDeleteDeviceConfirm(null)}>
+            <div style={s.modal} onMouseDown={e => e.stopPropagation()}>
+              <div style={s.modalTitle}>{t('devices.deleteConfirmTitle')}</div>
+              <div style={s.modalSub}>{deleteDeviceConfirm.username}@{deleteDeviceConfirm.host}:{deleteDeviceConfirm.port}</div>
+              <div style={s.warningText}>
+                {t('devices.deleteConfirmMessage').replace('{name}', deleteDeviceConfirm.name)}
+              </div>
+              <div style={s.modalActions}>
+                <button style={s.menuBtn} onClick={() => setDeleteDeviceConfirm(null)}>{t('general.cancel')}</button>
+                <button
+                  style={s.dangerBtn}
+                  onClick={() => {
+                    const device = deleteDeviceConfirm
+                    setDeleteDeviceConfirm(null)
+                    removeDeviceRecord(device).catch(err => console.warn('[devices] remove failed', err))
+                  }}
+                >
+                  {t('general.delete')}
+                </button>
               </div>
             </div>
           </div>
@@ -360,6 +389,7 @@ const s: Record<string, React.CSSProperties> = {
   modalTitle: { color:'var(--t0)', fontSize:'var(--ui-font-md)', fontWeight:700 },
   modalSub: { color:'var(--t2)', fontSize:'var(--ui-font-sm)', fontFamily:'var(--fm)' },
   modalEmpty: { color:'var(--t2)', fontSize:'var(--ui-font)', padding:'12px 0' },
+  warningText: { color:'var(--t1)', fontSize:'var(--ui-font)', lineHeight:1.55, whiteSpace:'pre-wrap' },
   hostKeyList: { maxHeight:240, overflowY:'auto', display:'flex', flexDirection:'column', gap:6 },
   hostKeyRow: { border:'1px solid var(--b0)', borderRadius:4, background:'var(--c0)', padding:8, display:'flex', flexDirection:'column', gap:4 },
   hostKeyTop: { color:'var(--t1)', fontSize:'var(--ui-font-sm)' },

@@ -1,10 +1,14 @@
 ﻿import { getCurrentWindow } from '@tauri-apps/api/window'
-import { Suspense, lazy, useRef, useCallback, useEffect, useMemo } from 'react'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { Suspense, lazy, useRef, useCallback, useEffect, useMemo, useState } from 'react'
 import { useStore } from './store'
 import { Sidebar } from './components/Sidebar'
 import { listCommandHistory, listDevices, listSnippets } from './lib/db'
 import { sshCollectDeviceStats, type DeviceStats } from './lib/ssh'
 import { useI18n } from './i18n'
+import { customThemeCssVars, themeColorScheme } from './lib/theme'
+import { checkForUpdates, type UpdateInfo } from './lib/update'
+import { UpdateDialog } from './components/UpdateDialog'
 
 const win = getCurrentWindow()
 const TerminalView = lazy(() => import('./components/TerminalView').then(module => ({ default: module.TerminalView })))
@@ -21,14 +25,22 @@ export default function App() {
   const { conns, activeId, rightOpen, showConnect, toggleRight, sidebarOpen, toggleSidebar,
           localOpen, localHeight, bottomPanelMode, toggleLocal, setLocalHeight, setCommandPaletteOpen,
           commandPaletteOpen, showSettings, setConns, setCommandHistory, setCommandSnippets, rightTab,
-          themeMode, uiFontSize, patchConn, sidebarWidth, setSidebarWidth, rightDockWidth } = useStore(s => s)
+          themeMode, customThemes, uiFontSize, patchConn, sidebarWidth, setSidebarWidth, rightDockWidth,
+          autoCheckUpdates } = useStore(s => s)
   const active = conns.find(c => c.id === activeId)
+  const customTheme = useMemo(
+    () => customThemes.find(theme => theme.id === themeMode) ?? null,
+    [customThemes, themeMode],
+  )
+  const [backgroundImageUrl, setBackgroundImageUrl] = useState('')
   const connectedSessions = useMemo(() => conns
     .filter(c => c.status === 'connected' && c.sessionId)
     .map(c => ({ id: c.id, sessionId: c.sessionId! })), [conns])
   const connectedSessionKey = connectedSessions.map(c => `${c.id}:${c.sessionId}`).join('|')
   const secondaryDataLoadedRef = useRef(false)
   const rightDockMountedRef = useRef(rightOpen)
+  const autoUpdateCheckedRef = useRef(false)
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -115,9 +127,44 @@ export default function App() {
   if (rightOpen) rightDockMountedRef.current = true
 
   useEffect(() => {
-    document.documentElement.dataset.theme = themeMode
-    document.documentElement.dataset.uiFontSize = uiFontSize
-  }, [themeMode, uiFontSize])
+    let cancelled = false
+    const path = customTheme?.backgroundImagePath
+    if (!path) {
+      setBackgroundImageUrl('')
+      return
+    }
+    invoke<string>('read_image_data_url', { path })
+      .then(url => {
+        if (!cancelled) {
+          setBackgroundImageUrl(url)
+          console.info('[theme] background image loaded via data url')
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          const fallbackUrl = convertFileSrc(path)
+          setBackgroundImageUrl(fallbackUrl)
+          console.warn('[theme] background data url failed; using asset fallback', err)
+        }
+      })
+    return () => { cancelled = true }
+  }, [customTheme?.backgroundImagePath])
+
+  useEffect(() => {
+    const root = document.documentElement
+    const style = root.style
+    root.dataset.theme = customTheme ? 'custom' : themeMode
+    root.dataset.colorScheme = themeColorScheme(themeMode)
+    root.dataset.uiFontSize = uiFontSize
+    root.dataset.hasBg = backgroundImageUrl ? 'true' : 'false'
+
+    const customVars = ['--c0', '--c1', '--c2', '--c3', '--c4', '--b0', '--b1', '--b2', '--t0', '--t1', '--t2', '--t3', '--acc', '--red', '--grn']
+    customVars.forEach(name => style.removeProperty(name))
+
+    if (customTheme) {
+      Object.entries(customThemeCssVars(customTheme)).forEach(([name, value]) => style.setProperty(name, value))
+    }
+  }, [backgroundImageUrl, customTheme, themeMode, uiFontSize])
 
   useEffect(() => {
     let disposed = false
@@ -150,6 +197,19 @@ export default function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [setCommandPaletteOpen])
+
+  useEffect(() => {
+    if (!autoCheckUpdates || autoUpdateCheckedRef.current) return
+    autoUpdateCheckedRef.current = true
+    const timer = window.setTimeout(() => {
+      checkForUpdates()
+        .then(update => {
+          if (update) setAvailableUpdate(update)
+        })
+        .catch(err => console.warn('[update] auto check failed', err))
+    }, 1500)
+    return () => window.clearTimeout(timer)
+  }, [autoCheckUpdates])
 
   // Vertical drag-resize for local panel
   const dragState = useRef<{ startY: number; startH: number } | null>(null)
@@ -184,8 +244,17 @@ export default function App() {
     e.preventDefault()
   }, [sidebarOpen, sidebarWidth, setSidebarWidth])
 
+  const appStyle = useMemo(() => ({
+    ...s.app,
+    backgroundColor: backgroundImageUrl ? 'transparent' : 'var(--c0)',
+    backgroundImage: backgroundImageUrl ? `url("${backgroundImageUrl}")` : undefined,
+    backgroundSize: 'cover',
+    backgroundPosition: 'center',
+    backgroundRepeat: 'no-repeat',
+  }), [backgroundImageUrl])
+
   return (
-    <div style={s.app}>
+    <div style={appStyle}>
       {/* Titlebar */}
       <div style={s.titlebar} data-tauri-drag-region>
         <button style={s.tbBtn} onClick={toggleSidebar} title="toggle sidebar">
@@ -283,6 +352,7 @@ export default function App() {
         {showSettings && <SettingsDialog />}
         {commandPaletteOpen && <CommandPalette />}
       </Suspense>
+      {availableUpdate && <UpdateDialog update={availableUpdate} onClose={() => setAvailableUpdate(null)} />}
     </div>
   )
 }
@@ -361,9 +431,9 @@ const s: Record<string, React.CSSProperties> = {
   wmBtn: { width:46, height:34, border:'none', background:'transparent', display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, color:'var(--t1)', cursor:'pointer', transition:'background 0.12s ease, color 0.12s ease', fontFamily:'var(--fs)', padding:0 } as React.CSSProperties,
   body: { display:'flex', flex:1, minHeight:0 },
   dh: { width:5, marginLeft:-2, marginRight:-3, background:'transparent', flexShrink:0, cursor:'col-resize', zIndex:6 },
-  main: { flex:1, display:'flex', flexDirection:'column', minWidth:0, minHeight:0, overflow:'hidden', background:'var(--c1)' },
+  main: { flex:1, display:'flex', flexDirection:'column', minWidth:0, minHeight:0, overflow:'hidden', background:'transparent' },
   panerow: { flex:'1 1 0px', display:'flex', minHeight:0, overflow:'hidden' },
-  terminalStack: { flex:1, minWidth:0, minHeight:0, position:'relative', background:'var(--c0)' },
+  terminalStack: { flex:1, minWidth:0, minHeight:0, position:'relative', background:'transparent' },
   rightDockShell: { flexShrink:0, minWidth:0, minHeight:0, height:'100%', display:'flex', overflow:'hidden', transition:'width 0.16s ease', willChange:'width' },
   welcome: { width:'100%', height:'100%', minWidth:0, background:'var(--c0)', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:6, color:'var(--t2)' },
   rsb: { width:200, flexShrink:0, background:'var(--c0)', borderLeft:'1px solid var(--b1)', display:'flex', flexDirection:'column', overflow:'hidden' },
