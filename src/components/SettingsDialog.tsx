@@ -79,7 +79,7 @@ export function SettingsDialog() {
   const [selectedId, setSelectedId] = useState<string>('')
   const [notice, setNotice] = useState('')
   const [themeDraft, setThemeDraft] = useState<CustomThemeDraft | null>(null)
-  const [currentVersion, setCurrentVersion] = useState('0.1.0')
+  const [currentVersion, setCurrentVersion] = useState('0.2.0')
   const [checkingUpdate, setCheckingUpdate] = useState(false)
   const [updateNotice, setUpdateNotice] = useState('')
   const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null)
