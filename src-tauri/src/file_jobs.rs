@@ -266,6 +266,29 @@ pub async fn file_queue_preview(
     Ok(job)
 }
 
+pub async fn list_remote_files_for_agent(
+    session_id: Option<&str>,
+    sessions: &SessionStore,
+    path: &str,
+) -> Result<Vec<RemoteFileEntry>, String> {
+    let session_id = session_id.ok_or_else(|| {
+        "Remote file listing requires an active SSH session. Connect the device first.".to_string()
+    })?;
+    let handle = {
+        let guard = sessions.lock().await;
+        guard
+            .get(session_id)
+            .map(|session| session.handle.clone())
+            .ok_or_else(|| "Remote file listing requires a connected SSH session.".to_string())?
+    };
+    let path = if path.trim().is_empty() {
+        "."
+    } else {
+        path.trim()
+    };
+    list_dir_russh(handle, path).await
+}
+
 #[tauri::command]
 pub async fn file_queue_download(
     device_id: String,

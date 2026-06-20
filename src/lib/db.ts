@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export interface DeviceRecord {
   id: string
@@ -91,3 +92,6 @@ export const saveSnippet = (input: SaveSnippetInput): Promise<SnippetRecord> =>
 
 export const deleteSnippet = (id: string): Promise<void> =>
   invoke('db_delete_snippet', { id })
+
+export const onSnippetUpdated = (cb: (snippet: SnippetRecord) => void): Promise<UnlistenFn> =>
+  listen<SnippetRecord>('snippet-updated', e => cb(e.payload))

@@ -393,6 +393,73 @@ impl Db {
         get_ai_tool_run(&conn, tool_run_id)
     }
 
+    pub fn search_command_history(
+        &self,
+        device_id: Option<&str>,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<CommandHistoryEntry>, String> {
+        let limit = limit.clamp(1, 100);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let query = query.map(str::trim).filter(|value| !value.is_empty());
+        match (device_id, query) {
+            (Some(device_id), Some(query)) => list_history_with_params(
+                &conn,
+                "SELECT id, device_id, command, created_at
+                 FROM command_history
+                 WHERE device_id = ?1 AND command LIKE ?2 ESCAPE '\\'
+                 ORDER BY created_at DESC
+                 LIMIT ?3",
+                params![device_id, like_pattern(query), limit],
+            ),
+            (Some(device_id), None) => list_history_with_params(
+                &conn,
+                "SELECT id, device_id, command, created_at
+                 FROM command_history
+                 WHERE device_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                params![device_id, limit],
+            ),
+            (None, Some(query)) => list_history_with_params(
+                &conn,
+                "SELECT id, device_id, command, created_at
+                 FROM command_history
+                 WHERE command LIKE ?1 ESCAPE '\\'
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                params![like_pattern(query), limit],
+            ),
+            (None, None) => list_history_with_params(
+                &conn,
+                "SELECT id, device_id, command, created_at
+                 FROM command_history
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+                params![limit],
+            ),
+        }
+    }
+
+    pub fn list_snippets(&self) -> Result<Vec<Snippet>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        list_snippets_inner(&conn)
+    }
+
+    pub fn save_snippet(&self, input: SaveSnippetInput) -> Result<Snippet, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        save_snippet_inner(&conn, input)
+    }
+
     pub fn latest_ai_session_snapshot(
         &self,
         conversation_id: &str,
@@ -916,6 +983,10 @@ pub fn db_clear_command_history(
 #[tauri::command]
 pub fn db_list_snippets(db: State<'_, Db>) -> Result<Vec<Snippet>, String> {
     let conn = lock_conn(&db)?;
+    list_snippets_inner(&conn)
+}
+
+fn list_snippets_inner(conn: &Connection) -> Result<Vec<Snippet>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, name, command, created_at, updated_at
@@ -941,6 +1012,11 @@ pub fn db_list_snippets(db: State<'_, Db>) -> Result<Vec<Snippet>, String> {
 
 #[tauri::command]
 pub fn db_save_snippet(input: SaveSnippetInput, db: State<'_, Db>) -> Result<Snippet, String> {
+    let conn = lock_conn(&db)?;
+    save_snippet_inner(&conn, input)
+}
+
+fn save_snippet_inner(conn: &Connection, input: SaveSnippetInput) -> Result<Snippet, String> {
     let name = input.name.trim().trim_start_matches('/').to_string();
     let command = input.command.trim().to_string();
     if name.is_empty() {
@@ -952,7 +1028,6 @@ pub fn db_save_snippet(input: SaveSnippetInput, db: State<'_, Db>) -> Result<Sni
 
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = now_ms();
-    let conn = lock_conn(&db)?;
     conn.execute(
         r#"
         INSERT INTO snippets (id, name, command, created_at, updated_at)
@@ -1863,4 +1938,20 @@ where
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+fn like_pattern(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len() + 2);
+    escaped.push('%');
+    for ch in query.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('%');
+    escaped
 }

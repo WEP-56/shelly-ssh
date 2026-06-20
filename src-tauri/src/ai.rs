@@ -1,4 +1,8 @@
-use crate::db::{AiMessage, AiProvider, AiSessionSnapshot, AiToolRun, Db};
+use crate::db::{
+    AiMessage, AiProvider, AiSessionSnapshot, AiToolRun, CommandHistoryEntry, Db,
+    SaveSnippetInput, Snippet,
+};
+use crate::file_jobs::{list_remote_files_for_agent, RemoteFileEntry};
 use crate::ssh::{SessionStore, TerminalCommandRecord};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -27,9 +31,14 @@ const WEB_FETCH_MAX_CHARS: usize = 80_000;
 const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 15;
 const WEB_FETCH_MAX_TIMEOUT_SECS: u64 = 30;
 const WEB_FETCH_MAX_BODY_BYTES: usize = 1_000_000;
+const REMOTE_FILE_LIST_DEFAULT_LIMIT: usize = 100;
+const REMOTE_FILE_LIST_MAX_LIMIT: usize = 500;
+const COMMAND_HISTORY_DEFAULT_LIMIT: u32 = 20;
+const COMMAND_HISTORY_MAX_LIMIT: u32 = 100;
 
 const STATIC_SYSTEM_PROMPT: &str = r#"[Identity]
 You are Shelly Agent, an SSH operations assistant embedded in Shelly, a desktop SSH client.
+The product name is spelled exactly "Shelly".
 You are helping the user work inside the currently selected SSH connection. The user can see the main SSH terminal. You may inspect terminal context, explain what is happening, suggest commands, and request command execution through Shelly tools.
 You are not running inside the remote server. You operate through Shelly's controlled tools and the user's visible SSH terminal.
 Your job is to help the user understand, operate, and troubleshoot the connected machine efficiently while keeping the user in control.
@@ -87,6 +96,33 @@ web_fetch(url, maxChars?, timeoutSecs?)
 - Prefer official or user-provided URLs.
 - Do not use it for private URLs, credentials, local network addresses, or data exfiltration.
 - Treat fetched content as external evidence. If extraction is truncated or noisy, say so.
+
+get_session_info(sessionId?)
+- Purpose: return Shelly's current known SSH session metadata and connection status without running remote commands.
+- Use it when the user asks which server/session/device is active, or before command execution when the target session may be ambiguous.
+- This is metadata from Shelly's connection state and latest session snapshot, not proof of remote command output.
+
+list_remote_files(path, sessionId?, limit?)
+- Purpose: list entries in a remote directory through Shelly's existing SFTP connection.
+- Use it when the user asks about remote project structure, directory contents, or whether a path contains files, and a directory listing is enough.
+- This is read-only metadata. It does not read file contents, upload, download, create, rename, or delete files.
+- Do not use it for private key paths or credential directories unless the user explicitly asks and the request is safe to answer with names only.
+
+search_command_history(query?, deviceId?, limit?)
+- Purpose: search Shelly's local command history records.
+- Use it when the user asks for a command they used before, wants to reuse a workflow, or asks for recent commands.
+- This searches Shelly's saved local history, not the remote shell's full history file.
+
+list_snippets(query?, limit?)
+- Purpose: list or search Shelly snippets, which are user-defined long commands mapped to short names for quick terminal insertion.
+- Use it when the user asks what snippets exist, wants to reuse a saved workflow, or asks about a shortcut command.
+- This is read-only and returns local Shelly snippet metadata and command text.
+
+write_snippet(name, command, id?, purpose?)
+- Purpose: create or update one Shelly snippet.
+- This writes local Shelly snippet data and requires user approval before saving.
+- Use it when the user explicitly asks to save, create, update, or remember a reusable command shortcut.
+- Do not use it to write remote files or execute commands.
 
 exec_command(cmd, purpose)
 - Purpose: request approval to write a command into the user's visible SSH terminal.
@@ -185,6 +221,16 @@ pub struct AiCompleteInteractiveToolInput {
     pub tool_run_id: String,
     pub active_session_id: String,
     pub output: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SnippetUpdatedEvent {
+    id: String,
+    name: String,
+    command: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -497,6 +543,67 @@ async fn run_agent_turn(
                     completed_without_approval += 1;
                     continue;
                 }
+                if call.name == "get_session_info" {
+                    let tool_message = execute_get_session_info_tool(
+                        &call,
+                        active_session_id,
+                        latest_snapshot.as_ref(),
+                        sessions.clone(),
+                    )
+                    .await;
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "list_remote_files" {
+                    let tool_message =
+                        execute_list_remote_files_tool(&call, active_session_id, sessions.clone())
+                            .await;
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "search_command_history" {
+                    let tool_message = execute_search_command_history_tool(
+                        &call,
+                        latest_snapshot.as_ref(),
+                        db,
+                    );
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "list_snippets" {
+                    let tool_message = execute_list_snippets_tool(&call, db);
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "write_snippet" {
+                    let parsed = parse_write_snippet_args(&call.args_json)?;
+                    let tool_run = db.create_ai_tool_run(
+                        &conversation.id,
+                        &conversation.server_key,
+                        active_session_id,
+                        assistant.as_ref().map(|msg| msg.id.as_str()),
+                        &call.id,
+                        &call.name,
+                        &call.args_json,
+                        Some(&format!("write_snippet /{}\n{}", parsed.name, parsed.command)),
+                        "medium",
+                    )?;
+                    emit_tool_approval(
+                        app,
+                        &conversation.server_key,
+                        active_session_id,
+                        &tool_run,
+                        parsed.purpose.as_deref(),
+                        None,
+                        vec!["writes local Shelly snippet data".to_string()],
+                    );
+                    approval_count += 1;
+                    continue;
+                }
                 if call.name != "exec_command" {
                     let note = format!("Model requested unsupported tool '{}'.", call.name);
                     let _ = db.append_ai_message(&conversation.id, "assistant", Some(&note));
@@ -665,6 +772,9 @@ pub async fn ai_execute_approved_tool(
     app: AppHandle,
 ) -> Result<AiToolRun, String> {
     let run = db.ai_tool_run(&input.tool_run_id)?;
+    if run.tool_name == "write_snippet" {
+        return execute_approved_write_snippet_tool(input, db, sessions, app).await;
+    }
     if run.tool_name != "exec_command" {
         return Err(format!("unsupported tool: {}", run.tool_name));
     }
@@ -1318,6 +1428,453 @@ async fn execute_web_fetch_tool(call: &AgentToolCall) -> String {
         },
         Err(err) => format!("Tool result for web_fetch\nstatus: error\nerror: {err}"),
     }
+}
+
+async fn execute_get_session_info_tool(
+    call: &AgentToolCall,
+    active_session_id: Option<&str>,
+    latest_snapshot: Option<&AiSessionSnapshot>,
+    sessions: SessionStore,
+) -> String {
+    match parse_get_session_info_args(&call.args_json, active_session_id) {
+        Ok(requested_session_id) => {
+            let connected = if let Some(session_id) = requested_session_id.as_deref() {
+                let guard = sessions.lock().await;
+                guard.contains_key(session_id)
+            } else {
+                false
+            };
+            let status = if connected {
+                "connected"
+            } else if requested_session_id.is_some() {
+                "disconnected"
+            } else {
+                "unknown"
+            };
+            let session_id = requested_session_id
+                .or_else(|| latest_snapshot.and_then(|snapshot| snapshot.session_id.clone()));
+            let result = json!({
+                "sessionId": session_id,
+                "status": status,
+                "connected": connected,
+                "deviceId": latest_snapshot.and_then(|snapshot| snapshot.device_id.clone()),
+                "name": latest_snapshot
+                    .and_then(|snapshot| snapshot.terminal_title.clone())
+                    .or_else(|| latest_snapshot.and_then(|snapshot| snapshot.hostname.clone())),
+                "host": latest_snapshot.and_then(|snapshot| snapshot.host.clone()),
+                "port": latest_snapshot.and_then(|snapshot| snapshot.port),
+                "username": latest_snapshot.and_then(|snapshot| snapshot.username.clone()),
+                "hostname": latest_snapshot.and_then(|snapshot| snapshot.hostname.clone()),
+                "os": latest_snapshot.and_then(|snapshot| snapshot.os.clone()),
+                "shell": latest_snapshot.and_then(|snapshot| snapshot.shell.clone()),
+                "cwd": latest_snapshot.and_then(|snapshot| snapshot.cwd.clone()),
+                "serverKey": latest_snapshot.map(|snapshot| snapshot.server_key.clone()),
+                "snapshotCapturedAt": latest_snapshot.map(|snapshot| snapshot.captured_at),
+                "source": "shelly_session_state_and_latest_snapshot"
+            });
+            format!(
+                "Tool result for get_session_info\nstatus: completed\n{}",
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+            )
+        }
+        Err(err) => format!("Tool result for get_session_info\nstatus: error\nerror: {err}"),
+    }
+}
+
+fn parse_get_session_info_args(
+    args_json: &str,
+    active_session_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let value: Value = if args_json.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(args_json)
+            .map_err(|e| format!("invalid get_session_info arguments: {e}"))?
+    };
+    Ok(value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| active_session_id.map(ToString::to_string)))
+}
+
+async fn execute_list_remote_files_tool(
+    call: &AgentToolCall,
+    active_session_id: Option<&str>,
+    sessions: SessionStore,
+) -> String {
+    match parse_list_remote_files_args(&call.args_json, active_session_id) {
+        Ok(args) => {
+            match list_remote_files_for_agent(
+                Some(args.session_id.as_str()),
+                &sessions,
+                args.path.as_str(),
+            )
+            .await
+            {
+                Ok(entries) => {
+                    let total_entries = entries.len();
+                    let truncated = total_entries > args.limit;
+                    let entries = entries
+                        .into_iter()
+                        .take(args.limit)
+                        .map(remote_file_entry_json)
+                        .collect::<Vec<_>>();
+                    let returned_entries = entries.len();
+                    let result = json!({
+                        "sessionId": args.session_id,
+                        "path": args.path,
+                        "entries": entries,
+                        "totalEntries": total_entries,
+                        "returnedEntries": returned_entries,
+                        "truncated": truncated,
+                        "scope": "sftp_directory_listing_only"
+                    });
+                    format!(
+                        "Tool result for list_remote_files\nstatus: completed\n{}",
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                    )
+                }
+                Err(err) => {
+                    format!("Tool result for list_remote_files\nstatus: error\nerror: {err}")
+                }
+            }
+        }
+        Err(err) => format!("Tool result for list_remote_files\nstatus: error\nerror: {err}"),
+    }
+}
+
+struct ListRemoteFilesArgs {
+    session_id: String,
+    path: String,
+    limit: usize,
+}
+
+fn parse_list_remote_files_args(
+    args_json: &str,
+    active_session_id: Option<&str>,
+) -> Result<ListRemoteFilesArgs, String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|e| format!("invalid list_remote_files arguments: {e}"))?;
+    let session_id = value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| active_session_id.map(ToString::to_string))
+        .ok_or_else(|| "list_remote_files requires an active SSH session".to_string())?;
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(".")
+        .to_string();
+    let limit = value
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(REMOTE_FILE_LIST_DEFAULT_LIMIT)
+        .clamp(1, REMOTE_FILE_LIST_MAX_LIMIT);
+    Ok(ListRemoteFilesArgs {
+        session_id,
+        path,
+        limit,
+    })
+}
+
+fn remote_file_entry_json(entry: RemoteFileEntry) -> Value {
+    json!({
+        "name": entry.name,
+        "path": entry.path,
+        "isDir": entry.is_dir,
+        "size": entry.size,
+        "modifiedAt": entry.modified_at,
+        "permissions": entry.permissions
+    })
+}
+
+fn execute_search_command_history_tool(
+    call: &AgentToolCall,
+    latest_snapshot: Option<&AiSessionSnapshot>,
+    db: &Db,
+) -> String {
+    match parse_search_command_history_args(&call.args_json, latest_snapshot) {
+        Ok(args) => match db.search_command_history(
+            args.device_id.as_deref(),
+            args.query.as_deref(),
+            args.limit,
+        ) {
+            Ok(entries) => {
+                let result = json!({
+                    "query": args.query,
+                    "deviceId": args.device_id,
+                    "entries": entries.iter().map(command_history_entry_json).collect::<Vec<_>>(),
+                    "returnedEntries": entries.len(),
+                    "scope": "shelly_local_command_history"
+                });
+                format!(
+                    "Tool result for search_command_history\nstatus: completed\n{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                )
+            }
+            Err(err) => {
+                format!("Tool result for search_command_history\nstatus: error\nerror: {err}")
+            }
+        },
+        Err(err) => {
+            format!("Tool result for search_command_history\nstatus: error\nerror: {err}")
+        }
+    }
+}
+
+struct SearchCommandHistoryArgs {
+    query: Option<String>,
+    device_id: Option<String>,
+    limit: u32,
+}
+
+fn parse_search_command_history_args(
+    args_json: &str,
+    latest_snapshot: Option<&AiSessionSnapshot>,
+) -> Result<SearchCommandHistoryArgs, String> {
+    let value: Value = if args_json.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(args_json)
+            .map_err(|e| format!("invalid search_command_history arguments: {e}"))?
+    };
+    let query = value
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let device_id = value
+        .get("deviceId")
+        .or_else(|| value.get("device_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| latest_snapshot.and_then(|snapshot| snapshot.device_id.clone()));
+    let limit = value
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+        .unwrap_or(COMMAND_HISTORY_DEFAULT_LIMIT)
+        .clamp(1, COMMAND_HISTORY_MAX_LIMIT);
+    Ok(SearchCommandHistoryArgs {
+        query,
+        device_id,
+        limit,
+    })
+}
+
+fn command_history_entry_json(entry: &CommandHistoryEntry) -> Value {
+    json!({
+        "id": entry.id,
+        "deviceId": entry.device_id,
+        "command": entry.command,
+        "createdAt": entry.created_at
+    })
+}
+
+fn execute_list_snippets_tool(call: &AgentToolCall, db: &Db) -> String {
+    match parse_list_snippets_args(&call.args_json) {
+        Ok(args) => match db.list_snippets() {
+            Ok(snippets) => {
+                let query_lower = args.query.as_ref().map(|query| query.to_ascii_lowercase());
+                let filtered = snippets
+                    .into_iter()
+                    .filter(|snippet| {
+                        if let Some(query) = query_lower.as_ref() {
+                            snippet.name.to_ascii_lowercase().contains(query)
+                                || snippet.command.to_ascii_lowercase().contains(query)
+                        } else {
+                            true
+                        }
+                    })
+                    .take(args.limit)
+                    .map(snippet_json)
+                    .collect::<Vec<_>>();
+                let returned_entries = filtered.len();
+                let result = json!({
+                    "query": args.query,
+                    "snippets": filtered,
+                    "returnedEntries": returned_entries,
+                    "scope": "shelly_local_snippets"
+                });
+                format!(
+                    "Tool result for list_snippets\nstatus: completed\n{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                )
+            }
+            Err(err) => format!("Tool result for list_snippets\nstatus: error\nerror: {err}"),
+        },
+        Err(err) => format!("Tool result for list_snippets\nstatus: error\nerror: {err}"),
+    }
+}
+
+struct ListSnippetsArgs {
+    query: Option<String>,
+    limit: usize,
+}
+
+fn parse_list_snippets_args(args_json: &str) -> Result<ListSnippetsArgs, String> {
+    let value: Value = if args_json.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(args_json)
+            .map_err(|e| format!("invalid list_snippets arguments: {e}"))?
+    };
+    let query = value
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let limit = value
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(50)
+        .clamp(1, 200);
+    Ok(ListSnippetsArgs { query, limit })
+}
+
+#[derive(Debug)]
+struct WriteSnippetArgs {
+    id: Option<String>,
+    name: String,
+    command: String,
+    purpose: Option<String>,
+}
+
+fn parse_write_snippet_args(args_json: &str) -> Result<WriteSnippetArgs, String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|e| format!("invalid write_snippet arguments: {e}"))?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|value| value.trim_start_matches('/'))
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "write_snippet requires name".to_string())?;
+    let command = value
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "write_snippet requires command".to_string())?;
+    let purpose = value
+        .get("purpose")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    Ok(WriteSnippetArgs {
+        id,
+        name,
+        command,
+        purpose,
+    })
+}
+
+fn snippet_json(snippet: Snippet) -> Value {
+    json!({
+        "id": snippet.id,
+        "name": snippet.name,
+        "slashName": format!("/{}", snippet.name),
+        "command": snippet.command,
+        "createdAt": snippet.created_at,
+        "updatedAt": snippet.updated_at
+    })
+}
+
+async fn execute_approved_write_snippet_tool(
+    input: AiExecuteToolInput,
+    db: State<'_, Db>,
+    sessions: State<'_, SessionStore>,
+    app: AppHandle,
+) -> Result<AiToolRun, String> {
+    let run = db.ai_tool_run(&input.tool_run_id)?;
+    if run.approval_status != "approved" {
+        return Err("tool run is not approved by the user".into());
+    }
+    let args = parse_write_snippet_args(&run.args_json)?;
+    let started = db.start_ai_tool_run(&input.tool_run_id, &input.active_session_id)?;
+    emit_status(&app, &started.conversation_id, "executing_tool", None);
+    let saved = db.save_snippet(SaveSnippetInput {
+        id: args.id,
+        name: args.name,
+        command: args.command,
+    })?;
+    let _ = app.emit(
+        "snippet-updated",
+        SnippetUpdatedEvent {
+            id: saved.id.clone(),
+            name: saved.name.clone(),
+            command: saved.command.clone(),
+            created_at: saved.created_at,
+            updated_at: saved.updated_at,
+        },
+    );
+    let output = format!(
+        "Saved Shelly snippet /{}\ncommand:\n{}",
+        saved.name, saved.command
+    );
+    let finished = db.finish_ai_tool_run(&input.tool_run_id, "completed", &output, None)?;
+    let _ = app.emit(
+        "ai-tool-output",
+        AiToolOutputEvent {
+            conversation_id: finished.conversation_id.clone(),
+            tool_run_id: finished.id.clone(),
+            output: output.clone(),
+        },
+    );
+    let _ = app.emit(
+        "ai-tool-result",
+        AiToolResultEvent {
+            conversation_id: finished.conversation_id.clone(),
+            tool_run_id: finished.id.clone(),
+            run_status: finished.run_status.clone(),
+            output: output.clone(),
+            timed_out: false,
+        },
+    );
+    db.append_ai_message(
+        &finished.conversation_id,
+        "tool",
+        Some(&format!(
+            "Tool result for write_snippet\nstatus: completed\n{}",
+            serde_json::to_string_pretty(&snippet_json(saved)).unwrap_or_else(|_| "{}".to_string())
+        )),
+    )?;
+    let conversation = db.ai_conversation(&finished.conversation_id)?;
+    let _ = run_agent_turn(
+        &db,
+        &app,
+        &conversation,
+        Some(&input.active_session_id),
+        None,
+        sessions.inner().clone(),
+    )
+    .await;
+    Ok(finished)
 }
 
 struct WebFetchArgs {
@@ -2256,6 +2813,11 @@ fn agent_tool_schemas_openai() -> Vec<Value> {
         list_terminal_commands_tool_schema_openai(),
         read_terminal_command_output_tool_schema_openai(),
         web_fetch_tool_schema_openai(),
+        get_session_info_tool_schema_openai(),
+        list_remote_files_tool_schema_openai(),
+        search_command_history_tool_schema_openai(),
+        list_snippets_tool_schema_openai(),
+        write_snippet_tool_schema_openai(),
         exec_command_tool_schema_openai(),
     ]
 }
@@ -2266,6 +2828,11 @@ fn agent_tool_schemas_claude() -> Vec<Value> {
         list_terminal_commands_tool_schema_claude(),
         read_terminal_command_output_tool_schema_claude(),
         web_fetch_tool_schema_claude(),
+        get_session_info_tool_schema_claude(),
+        list_remote_files_tool_schema_claude(),
+        search_command_history_tool_schema_claude(),
+        list_snippets_tool_schema_claude(),
+        write_snippet_tool_schema_claude(),
         exec_command_tool_schema_claude(),
     ]
 }
@@ -2406,6 +2973,166 @@ fn web_fetch_tool_schema_claude() -> Value {
                 "timeoutSecs": { "type": "integer", "description": "Request timeout in seconds. Defaults to 15, capped at 30." }
             },
             "required": ["url"]
+        }
+    })
+}
+
+fn get_session_info_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "get_session_info",
+        "description": "Return Shelly's current known SSH session metadata and connection status without running remote commands. Use when the user asks which server/session/device is active, or before command execution when the target session may be ambiguous. This is connection metadata and latest snapshot data, not proof of remote command output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn get_session_info_tool_schema_claude() -> Value {
+    json!({
+        "name": "get_session_info",
+        "description": "Return Shelly's current known SSH session metadata and connection status without running remote commands. Use when the user asks which server/session/device is active, or before command execution when the target session may be ambiguous. This is connection metadata and latest snapshot data, not proof of remote command output.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." }
+            }
+        }
+    })
+}
+
+fn list_remote_files_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "list_remote_files",
+        "description": "List entries in a remote directory through Shelly's existing SFTP connection. Read-only metadata only: names, paths, type, size, modified time, permissions. Does not read file contents or modify files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Remote directory path to list. Defaults to '.'." },
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." },
+                "limit": { "type": "integer", "description": "Maximum entries to return. Defaults to 100, capped at 500." }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn list_remote_files_tool_schema_claude() -> Value {
+    json!({
+        "name": "list_remote_files",
+        "description": "List entries in a remote directory through Shelly's existing SFTP connection. Read-only metadata only: names, paths, type, size, modified time, permissions. Does not read file contents or modify files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Remote directory path to list. Defaults to '.'." },
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." },
+                "limit": { "type": "integer", "description": "Maximum entries to return. Defaults to 100, capped at 500." }
+            },
+            "required": ["path"]
+        }
+    })
+}
+
+fn search_command_history_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "search_command_history",
+        "description": "Search Shelly's saved local command history, optionally scoped to the current device. Use when the user asks for a previous command or wants to reuse a workflow. This is not the remote shell's full history file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional substring to search for. Omit to list recent command history." },
+                "deviceId": { "type": "string", "description": "Optional Shelly device id. Omit to use the current device when available." },
+                "limit": { "type": "integer", "description": "Maximum entries to return. Defaults to 20, capped at 100." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn search_command_history_tool_schema_claude() -> Value {
+    json!({
+        "name": "search_command_history",
+        "description": "Search Shelly's saved local command history, optionally scoped to the current device. Use when the user asks for a previous command or wants to reuse a workflow. This is not the remote shell's full history file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional substring to search for. Omit to list recent command history." },
+                "deviceId": { "type": "string", "description": "Optional Shelly device id. Omit to use the current device when available." },
+                "limit": { "type": "integer", "description": "Maximum entries to return. Defaults to 20, capped at 100." }
+            }
+        }
+    })
+}
+
+fn list_snippets_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "list_snippets",
+        "description": "List or search Shelly snippets. Snippets are user-defined long commands mapped to short names for quick terminal insertion. Read-only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional substring to match against snippet name or command." },
+                "limit": { "type": "integer", "description": "Maximum snippets to return. Defaults to 50, capped at 200." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn list_snippets_tool_schema_claude() -> Value {
+    json!({
+        "name": "list_snippets",
+        "description": "List or search Shelly snippets. Snippets are user-defined long commands mapped to short names for quick terminal insertion. Read-only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional substring to match against snippet name or command." },
+                "limit": { "type": "integer", "description": "Maximum snippets to return. Defaults to 50, capped at 200." }
+            }
+        }
+    })
+}
+
+fn write_snippet_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "write_snippet",
+        "description": "Create or update one Shelly snippet. Requires user approval before saving because it writes local Shelly snippet data. Use only when the user explicitly asks to save, create, update, or remember a reusable command shortcut.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Optional existing snippet id when updating a known snippet." },
+                "name": { "type": "string", "description": "Snippet name, with or without leading slash." },
+                "command": { "type": "string", "description": "Exact command text to save in the snippet." },
+                "purpose": { "type": "string", "description": "Short explanation of why this snippet should be saved." }
+            },
+            "required": ["name", "command"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn write_snippet_tool_schema_claude() -> Value {
+    json!({
+        "name": "write_snippet",
+        "description": "Create or update one Shelly snippet. Requires user approval before saving because it writes local Shelly snippet data. Use only when the user explicitly asks to save, create, update, or remember a reusable command shortcut.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Optional existing snippet id when updating a known snippet." },
+                "name": { "type": "string", "description": "Snippet name, with or without leading slash." },
+                "command": { "type": "string", "description": "Exact command text to save in the snippet." },
+                "purpose": { "type": "string", "description": "Short explanation of why this snippet should be saved." }
+            },
+            "required": ["name", "command"]
         }
     })
 }

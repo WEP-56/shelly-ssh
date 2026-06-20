@@ -170,8 +170,8 @@ cargo check
 Windows release packaging is handled by GitHub Actions when a version tag is pushed:
 
 ```powershell
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The workflow creates a draft GitHub Release with Windows artifacts. Shelly's built-in updater reads the latest release from GitHub, compares tags semantically, downloads the matching installer, launches it, and exits the app after the installer process starts.

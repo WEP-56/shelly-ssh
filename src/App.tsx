@@ -3,7 +3,7 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { Suspense, lazy, useRef, useCallback, useEffect, useMemo, useState } from 'react'
 import { useStore } from './store'
 import { Sidebar } from './components/Sidebar'
-import { listCommandHistory, listDevices, listSnippets } from './lib/db'
+import { listCommandHistory, listDevices, listSnippets, onSnippetUpdated } from './lib/db'
 import { sshCollectDeviceStats, type DeviceStats } from './lib/ssh'
 import { useI18n } from './i18n'
 import { customThemeCssVars, themeColorScheme } from './lib/theme'
@@ -123,6 +123,33 @@ export default function App() {
     hydrateSecondaryData()
     return () => { cancelled = true }
   }, [commandPaletteOpen, rightOpen, rightTab, conns, setCommandHistory, setCommandSnippets])
+
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    const refreshSnippets = () => {
+      listSnippets()
+        .then(snippets => {
+          if (disposed) return
+          setCommandSnippets(snippets.map(snippet => ({
+            id: snippet.id,
+            name: snippet.name,
+            command: snippet.command,
+            createdAt: snippet.createdAt,
+            updatedAt: snippet.updatedAt,
+          })))
+        })
+        .catch(err => console.warn('[db] snippets refresh failed', err))
+    }
+    onSnippetUpdated(() => refreshSnippets()).then(fn => {
+      if (disposed) fn()
+      else unlisten = fn
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [setCommandSnippets])
 
   if (rightOpen) rightDockMountedRef.current = true
 
