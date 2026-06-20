@@ -165,6 +165,7 @@ export interface TerminalSnapshot {
   sessionId: string
   lines: string[]
   text: string
+  truncated: boolean
 }
 
 export const listAiProviders = (): Promise<AiProvider[]> =>

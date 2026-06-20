@@ -376,16 +376,14 @@ export function AgentPanel({ active, width }: { active: Connection | undefined; 
     const conv = await ensureConversation()
     setLines(prev => [...prev.filter(l => !l.pending), { id: `user-${Date.now()}`, role: 'user', text }])
     try {
-      let terminalContext: string | null = null
       if (active?.sessionId) {
         try {
-          terminalContext = (await readTerminal(active.sessionId, 120)).text
-          await refreshConversationSnapshot(conv.id, terminalContext)
+          await refreshConversationSnapshot(conv.id, null)
         } catch (err) {
           setNotice(t('shell.terminalContextUnavailable').replace('{error}', String(err)))
         }
       }
-      await sendAiMessage(conv.id, active?.sessionId ?? null, text, terminalContext)
+      await sendAiMessage(conv.id, active?.sessionId ?? null, text, null)
     } catch (err) {
       setLines(prev => prev.map(line => line.pending ? { ...line, pending: false, busy: false } : line))
       setNotice(String(err))

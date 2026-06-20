@@ -1,15 +1,32 @@
 use crate::db::{AiMessage, AiProvider, AiSessionSnapshot, AiToolRun, Db};
-use crate::ssh::SessionStore;
+use crate::ssh::{SessionStore, TerminalCommandRecord};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 const TOOL_DISPLAY_OUTPUT_MAX_CHARS: usize = 80_000;
 const TOOL_MODEL_OUTPUT_MAX_CHARS: usize = 12_000;
+const TERMINAL_TAIL_DEFAULT_LINES: usize = 80;
+const TERMINAL_TAIL_MAX_LINES: usize = 500;
+const TERMINAL_TAIL_DEFAULT_MAX_CHARS: usize = 12_000;
+const TERMINAL_TAIL_MAX_CHARS: usize = 50_000;
+const TERMINAL_COMMAND_RECORD_LIMIT: usize = 50;
+const TERMINAL_COMMAND_LIST_DEFAULT_LIMIT: usize = 20;
+const TERMINAL_COMMAND_LIST_MAX_LIMIT: usize = 50;
+const TERMINAL_COMMAND_PREVIEW_CHARS: usize = 600;
+const TERMINAL_COMMAND_OUTPUT_DEFAULT_MAX_CHARS: usize = 20_000;
+const TERMINAL_COMMAND_OUTPUT_MAX_CHARS: usize = 80_000;
+const WEB_FETCH_DEFAULT_MAX_CHARS: usize = 20_000;
+const WEB_FETCH_MAX_CHARS: usize = 80_000;
+const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 15;
+const WEB_FETCH_MAX_TIMEOUT_SECS: u64 = 30;
+const WEB_FETCH_MAX_BODY_BYTES: usize = 1_000_000;
 
 const STATIC_SYSTEM_PROMPT: &str = r#"[Identity]
 You are Shelly Agent, an SSH operations assistant embedded in Shelly, a desktop SSH client.
@@ -40,7 +57,40 @@ Your job is to help the user understand, operate, and troubleshoot the connected
 - Never turn a suggested command into an executed command in prose. If you did not receive a real tool result, say it is only a suggestion.
 
 [Tools]
-You may request command execution with exec_command(cmd, purpose). Shelly will show the command to the user for approval before anything is written to the visible SSH terminal.
+You have access to Shelly tools. Use read-only tools without asking for approval. Command execution always requires approval.
+Users will not always name the tool they expect. Infer the user's intent and choose the smallest, read-only, safest tool that can answer the question before considering command execution.
+
+read_terminal_tail(sessionId?, lines?, maxChars?)
+- Purpose: read recent visible terminal context from the current SSH tab.
+- Use it when the user's question depends on what is currently shown in the terminal, the latest command result, current prompt, cwd, or recent errors.
+- If you only need the current terminal state or latest command result, call read_terminal_tail first.
+- Do not ask the user to paste terminal output before trying read_terminal_tail.
+- Do not assume terminal state, cwd, command output, or file contents from memory.
+- Normal chat turns do not receive terminal history unless you explicitly call read_terminal_tail.
+
+list_terminal_commands(sessionId?, limit?)
+- Purpose: list recent command output records captured by Shelly Agent for the current SSH session.
+- Use it when read_terminal_tail is insufficient, truncated, interleaved, or the user asks about a specific earlier command.
+- Call read_terminal_tail first when you only need the latest visible output.
+- The list contains command IDs, commands, status, exit code, output size, and short previews. It is an index, not full output.
+- Current scope: this index only includes commands requested through exec_command and approved in Shelly Agent, plus completed interactive handoffs. It does not include arbitrary commands the user typed manually in the SSH terminal.
+
+read_terminal_command_output(commandId, offset?, maxChars?, mode?)
+- Purpose: read captured output for one Shelly Agent command by commandId.
+- Use it after list_terminal_commands identifies the relevant commandId, or when the commandId is already present in the conversation or a previous tool result.
+- Do not call it for arbitrary shell history. It only reads Shelly Agent captured command records.
+- Supported modes are window, head, tail, and full. Output is still capped by Shelly safety limits.
+
+web_fetch(url, maxChars?, timeoutSecs?)
+- Purpose: fetch public web documentation or project pages and return cleaned text plus metadata.
+- Use it when the user asks about public documentation, a GitHub project, Docker image, install guide, release note, API docs, or an error likely answered by current external docs.
+- Prefer official or user-provided URLs.
+- Do not use it for private URLs, credentials, local network addresses, or data exfiltration.
+- Treat fetched content as external evidence. If extraction is truncated or noisy, say so.
+
+exec_command(cmd, purpose)
+- Purpose: request approval to write a command into the user's visible SSH terminal.
+Shelly will show the command to the user for approval before anything is written to the visible SSH terminal.
 Only request exec_command when running a command is necessary. Prefer one clear command at a time, and explain the purpose briefly.
 If you say you are going to run, check, test, inspect, or try a command, you must call exec_command in that same response. Do not merely announce the next command in prose.
 If you cannot or do not call exec_command, phrase commands as suggestions for the user, such as "you can run..." or "I suggest running...".
@@ -67,6 +117,7 @@ pub struct TerminalSnapshot {
     pub session_id: String,
     pub lines: Vec<String>,
     pub text: String,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -204,6 +255,7 @@ impl AgentPrompt {
 pub async fn ai_send_message(
     input: AiSendMessageInput,
     db: State<'_, Db>,
+    sessions: State<'_, SessionStore>,
     app: AppHandle,
 ) -> Result<(), String> {
     let content = input.content.trim().to_string();
@@ -220,6 +272,7 @@ pub async fn ai_send_message(
         &conversation,
         input.active_session_id.as_deref(),
         input.terminal_context.as_deref(),
+        sessions.inner().clone(),
     )
     .await
 }
@@ -230,30 +283,59 @@ pub async fn ai_read_terminal(
     lines: Option<usize>,
     sessions: State<'_, SessionStore>,
 ) -> Result<TerminalSnapshot, String> {
+    read_terminal_tail_snapshot(sessions.inner(), &session_id, lines, None).await
+}
+
+async fn read_terminal_tail_snapshot(
+    sessions: &SessionStore,
+    session_id: &str,
+    lines: Option<usize>,
+    max_chars: Option<usize>,
+) -> Result<TerminalSnapshot, String> {
     let output = {
         let guard = sessions.lock().await;
         guard
-            .get(&session_id)
+            .get(session_id)
             .map(|session| session.output.clone())
             .ok_or_else(|| "SSH session is not connected".to_string())?
     };
     let text = output.lock().await.clone();
-    let max_lines = lines.unwrap_or(120).clamp(1, 500);
-    let lines = text
+    let max_lines = lines
+        .unwrap_or(TERMINAL_TAIL_DEFAULT_LINES)
+        .clamp(1, TERMINAL_TAIL_MAX_LINES);
+    let max_chars = max_chars
+        .unwrap_or(TERMINAL_TAIL_DEFAULT_MAX_CHARS)
+        .clamp(1_000, TERMINAL_TAIL_MAX_CHARS);
+    let all_lines = text
         .replace('\r', "")
         .lines()
+        .map(strip_ansi)
+        .collect::<Vec<_>>();
+    let mut truncated = all_lines.len() > max_lines;
+    let mut lines = all_lines
+        .iter()
         .rev()
         .take(max_lines)
-        .map(strip_ansi)
+        .cloned()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect::<Vec<_>>();
-    let text = lines.join("\n");
+    let mut text = lines.join("\n");
+    let char_count = text.chars().count();
+    if char_count > max_chars {
+        truncated = true;
+        text = text
+            .chars()
+            .skip(char_count.saturating_sub(max_chars))
+            .collect::<String>();
+        lines = text.lines().map(ToString::to_string).collect();
+    }
     Ok(TerminalSnapshot {
-        session_id,
+        session_id: session_id.to_string(),
         lines,
         text,
+        truncated,
     })
 }
 
@@ -263,6 +345,7 @@ async fn run_agent_turn(
     conversation: &crate::db::AiConversation,
     active_session_id: Option<&str>,
     terminal_context: Option<&str>,
+    sessions: SessionStore,
 ) -> Result<(), String> {
     let mut messages = db.ai_messages(&conversation.id)?;
     let (provider, api_key) = select_provider_with_key(db, conversation)?;
@@ -336,6 +419,7 @@ async fn run_agent_turn(
                         conversation,
                         active_session_id,
                         terminal_context,
+                        sessions.clone(),
                     ))
                     .await;
                 }
@@ -371,6 +455,7 @@ async fn run_agent_turn(
                         conversation,
                         active_session_id,
                         terminal_context,
+                        sessions.clone(),
                     ))
                     .await;
                 }
@@ -380,6 +465,38 @@ async fn run_agent_turn(
             let mut approval_count = 0;
             let mut completed_without_approval = 0;
             for call in stream.tool_calls {
+                if call.name == "read_terminal_tail" {
+                    let tool_message =
+                        execute_read_terminal_tail_tool(&call, active_session_id, sessions.clone())
+                            .await;
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "list_terminal_commands" {
+                    let tool_message = execute_list_terminal_commands_tool(
+                        &call,
+                        active_session_id,
+                        sessions.clone(),
+                    )
+                    .await;
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "read_terminal_command_output" {
+                    let tool_message =
+                        execute_read_terminal_command_output_tool(&call, sessions.clone()).await;
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
+                if call.name == "web_fetch" {
+                    let tool_message = execute_web_fetch_tool(&call).await;
+                    db.append_ai_message(&conversation.id, "tool", Some(&tool_message))?;
+                    completed_without_approval += 1;
+                    continue;
+                }
                 if call.name != "exec_command" {
                     let note = format!("Model requested unsupported tool '{}'.", call.name);
                     let _ = db.append_ai_message(&conversation.id, "assistant", Some(&note));
@@ -448,6 +565,7 @@ async fn run_agent_turn(
                     conversation,
                     active_session_id,
                     terminal_context,
+                    sessions.clone(),
                 ))
                 .await;
             } else {
@@ -503,6 +621,7 @@ pub fn ai_approve_tool(input: AiToolDecisionInput, db: State<'_, Db>) -> Result<
 pub async fn ai_deny_tool(
     input: AiToolDecisionInput,
     db: State<'_, Db>,
+    sessions: State<'_, SessionStore>,
     app: AppHandle,
 ) -> Result<AiToolRun, String> {
     let denied = db.set_ai_tool_approval(&input.tool_run_id, "denied")?;
@@ -532,6 +651,7 @@ pub async fn ai_deny_tool(
         &conversation,
         finished.session_id.as_deref(),
         None,
+        sessions.inner().clone(),
     )
     .await;
     Ok(finished)
@@ -563,7 +683,8 @@ pub async fn ai_execute_approved_tool(
     }
     let marker = marker_for_tool_run(&run.id);
     let wrapped_command = wrap_command_with_marker(&command, &marker);
-    let (input_tx, output, before_len) = {
+    let started_at = unix_time_ms();
+    let (input_tx, output, command_records, before_len) = {
         let guard = sessions.lock().await;
         let session = guard
             .get(&input.active_session_id)
@@ -572,6 +693,7 @@ pub async fn ai_execute_approved_tool(
         (
             session.input_tx.clone(),
             session.output.clone(),
+            session.command_records.clone(),
             before.len(),
         )
     };
@@ -600,6 +722,19 @@ pub async fn ai_execute_approved_tool(
     };
     let finished =
         db.finish_ai_tool_run(&input.tool_run_id, run_status, &cleaned, captured.exit_code)?;
+    push_terminal_command_record(
+        command_records,
+        TerminalCommandRecord {
+            command_id: finished.id.clone(),
+            command: command.clone(),
+            started_at,
+            ended_at: Some(unix_time_ms()),
+            status: finished.run_status.clone(),
+            exit_code: finished.exit_code,
+            output: cleaned.clone(),
+        },
+    )
+    .await;
     let _ = app.emit(
         "ai-tool-output",
         AiToolOutputEvent {
@@ -627,6 +762,7 @@ pub async fn ai_execute_approved_tool(
         &conversation,
         Some(&input.active_session_id),
         None,
+        sessions.inner().clone(),
     )
     .await;
     Ok(finished)
@@ -636,6 +772,7 @@ pub async fn ai_execute_approved_tool(
 pub async fn ai_complete_interactive_tool(
     input: AiCompleteInteractiveToolInput,
     db: State<'_, Db>,
+    sessions: State<'_, SessionStore>,
     app: AppHandle,
 ) -> Result<AiToolRun, String> {
     let run = db.ai_tool_run(&input.tool_run_id)?;
@@ -663,6 +800,23 @@ pub async fn ai_complete_interactive_tool(
     };
 
     let finished = db.finish_ai_tool_run(&input.tool_run_id, "completed", &output, None)?;
+    if let Some(command_records) =
+        terminal_command_records_for_session(&sessions, &input.active_session_id).await
+    {
+        push_terminal_command_record(
+            command_records,
+            TerminalCommandRecord {
+                command_id: finished.id.clone(),
+                command: command.clone(),
+                started_at: finished.started_at.unwrap_or_else(unix_time_ms),
+                ended_at: Some(unix_time_ms()),
+                status: finished.run_status.clone(),
+                exit_code: finished.exit_code,
+                output: output.clone(),
+            },
+        )
+        .await;
+    }
     let _ = app.emit(
         "ai-tool-output",
         AiToolOutputEvent {
@@ -690,6 +844,7 @@ pub async fn ai_complete_interactive_tool(
         &conversation,
         Some(&input.active_session_id),
         None,
+        sessions.inner().clone(),
     )
     .await;
     Ok(finished)
@@ -806,6 +961,695 @@ fn parse_exec_command_args(args_json: &str) -> Result<ExecCommandArgs, String> {
         purpose,
         interaction_tip,
     })
+}
+
+async fn execute_read_terminal_tail_tool(
+    call: &AgentToolCall,
+    active_session_id: Option<&str>,
+    sessions: SessionStore,
+) -> String {
+    match parse_read_terminal_tail_args(&call.args_json, active_session_id) {
+        Ok(args) => match read_terminal_tail_snapshot(
+            &sessions,
+            &args.session_id,
+            args.lines,
+            args.max_chars,
+        )
+        .await
+        {
+            Ok(snapshot) => format!(
+                "Tool result for read_terminal_tail\nstatus: completed\nsession_id: {}\nline_count: {}\ntruncated: {}\ntext:\n{}",
+                snapshot.session_id,
+                snapshot.lines.len(),
+                snapshot.truncated,
+                snapshot.text
+            ),
+            Err(err) => format!(
+                "Tool result for read_terminal_tail\nstatus: error\nerror: {}",
+                err
+            ),
+        },
+        Err(err) => format!(
+            "Tool result for read_terminal_tail\nstatus: error\nerror: {}",
+            err
+        ),
+    }
+}
+
+struct ReadTerminalTailArgs {
+    session_id: String,
+    lines: Option<usize>,
+    max_chars: Option<usize>,
+}
+
+fn parse_read_terminal_tail_args(
+    args_json: &str,
+    active_session_id: Option<&str>,
+) -> Result<ReadTerminalTailArgs, String> {
+    let value: Value = if args_json.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(args_json)
+            .map_err(|e| format!("invalid read_terminal_tail arguments: {e}"))?
+    };
+    let session_id = value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| active_session_id.map(ToString::to_string))
+        .ok_or_else(|| "read_terminal_tail requires an active SSH session".to_string())?;
+    let lines = value
+        .get("lines")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
+    let max_chars = value
+        .get("maxChars")
+        .or_else(|| value.get("max_chars"))
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
+    Ok(ReadTerminalTailArgs {
+        session_id,
+        lines,
+        max_chars,
+    })
+}
+
+async fn execute_list_terminal_commands_tool(
+    call: &AgentToolCall,
+    active_session_id: Option<&str>,
+    sessions: SessionStore,
+) -> String {
+    match parse_list_terminal_commands_args(&call.args_json, active_session_id) {
+        Ok(args) => match terminal_command_records_for_session(&sessions, &args.session_id).await {
+            Some(command_records) => {
+                let records = command_records.lock().await;
+                let commands = records
+                    .iter()
+                    .rev()
+                    .take(args.limit)
+                    .map(command_record_summary)
+                    .collect::<Vec<_>>();
+                let commands = commands.into_iter().rev().collect::<Vec<_>>();
+                format!(
+                    "Tool result for list_terminal_commands\nstatus: completed\nscope: shelly_agent_approved_commands_only\nsession_id: {}\ncommands:\n{}",
+                    args.session_id,
+                    serde_json::to_string_pretty(&commands).unwrap_or_else(|_| "[]".to_string())
+                )
+            }
+            None => format!(
+                "Tool result for list_terminal_commands\nstatus: error\nerror: SSH session is not connected"
+            ),
+        },
+        Err(err) => format!(
+            "Tool result for list_terminal_commands\nstatus: error\nerror: {}",
+            err
+        ),
+    }
+}
+
+struct ListTerminalCommandsArgs {
+    session_id: String,
+    limit: usize,
+}
+
+fn parse_list_terminal_commands_args(
+    args_json: &str,
+    active_session_id: Option<&str>,
+) -> Result<ListTerminalCommandsArgs, String> {
+    let value: Value = if args_json.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(args_json)
+            .map_err(|e| format!("invalid list_terminal_commands arguments: {e}"))?
+    };
+    let session_id = value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| active_session_id.map(ToString::to_string))
+        .ok_or_else(|| "list_terminal_commands requires an active SSH session".to_string())?;
+    let limit = value
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(TERMINAL_COMMAND_LIST_DEFAULT_LIMIT)
+        .clamp(1, TERMINAL_COMMAND_LIST_MAX_LIMIT);
+    Ok(ListTerminalCommandsArgs { session_id, limit })
+}
+
+fn command_record_summary(record: &TerminalCommandRecord) -> Value {
+    let clean_output = clean_captured_output(&record.output);
+    let output_chars = clean_output.chars().count();
+    let output_lines = clean_output.lines().count();
+    json!({
+        "commandId": record.command_id,
+        "command": record.command,
+        "startedAt": record.started_at,
+        "endedAt": record.ended_at,
+        "status": record.status,
+        "exitCode": record.exit_code,
+        "outputChars": output_chars,
+        "outputLines": output_lines,
+        "preview": preview_text(&clean_output, TERMINAL_COMMAND_PREVIEW_CHARS)
+    })
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.trim().to_string();
+    }
+    let tail = text
+        .chars()
+        .skip(count.saturating_sub(max_chars))
+        .collect::<String>();
+    format!(
+        "[preview truncated to last {max_chars} chars]\n{}",
+        tail.trim()
+    )
+}
+
+async fn terminal_command_records_for_session(
+    sessions: &SessionStore,
+    session_id: &str,
+) -> Option<Arc<Mutex<Vec<TerminalCommandRecord>>>> {
+    let guard = sessions.lock().await;
+    guard
+        .get(session_id)
+        .map(|session| session.command_records.clone())
+}
+
+async fn push_terminal_command_record(
+    command_records: Arc<Mutex<Vec<TerminalCommandRecord>>>,
+    record: TerminalCommandRecord,
+) {
+    let mut records = command_records.lock().await;
+    records.push(record);
+    let overflow = records.len().saturating_sub(TERMINAL_COMMAND_RECORD_LIMIT);
+    if overflow > 0 {
+        records.drain(0..overflow);
+    }
+}
+
+async fn execute_read_terminal_command_output_tool(
+    call: &AgentToolCall,
+    sessions: SessionStore,
+) -> String {
+    match parse_read_terminal_command_output_args(&call.args_json) {
+        Ok(args) => match find_terminal_command_record(&sessions, &args.command_id).await {
+            Some(record) => {
+                let clean_output = clean_captured_output(&record.output);
+                let total_chars = clean_output.chars().count();
+                let window = command_output_window(
+                    &clean_output,
+                    args.mode.as_str(),
+                    args.offset,
+                    args.max_chars,
+                );
+                format!(
+                    "Tool result for read_terminal_command_output\nstatus: completed\nscope: shelly_agent_approved_commands_only\ncommand_id: {}\ncommand: {}\nrun_status: {}\nexit_code: {}\noffset: {}\nreturned_chars: {}\ntotal_chars: {}\ntruncated: {}\noutput:\n{}",
+                    record.command_id,
+                    record.command,
+                    record.status,
+                    record
+                        .exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    window.offset,
+                    window.returned_chars,
+                    total_chars,
+                    window.truncated,
+                    window.output
+                )
+            }
+            None => format!(
+                "Tool result for read_terminal_command_output\nstatus: error\nerror: commandId not found in Shelly Agent captured command records"
+            ),
+        },
+        Err(err) => format!(
+            "Tool result for read_terminal_command_output\nstatus: error\nerror: {}",
+            err
+        ),
+    }
+}
+
+struct ReadTerminalCommandOutputArgs {
+    command_id: String,
+    offset: usize,
+    max_chars: usize,
+    mode: String,
+}
+
+fn parse_read_terminal_command_output_args(
+    args_json: &str,
+) -> Result<ReadTerminalCommandOutputArgs, String> {
+    let value: Value = serde_json::from_str(args_json)
+        .map_err(|e| format!("invalid read_terminal_command_output arguments: {e}"))?;
+    let command_id = value
+        .get("commandId")
+        .or_else(|| value.get("command_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "read_terminal_command_output requires commandId".to_string())?;
+    let offset = value
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    let max_chars = value
+        .get("maxChars")
+        .or_else(|| value.get("max_chars"))
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(TERMINAL_COMMAND_OUTPUT_DEFAULT_MAX_CHARS)
+        .clamp(1_000, TERMINAL_COMMAND_OUTPUT_MAX_CHARS);
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("window")
+        .to_ascii_lowercase();
+    let mode = match mode.as_str() {
+        "window" | "head" | "tail" | "full" => mode,
+        _ => return Err("mode must be one of: window, head, tail, full".to_string()),
+    };
+    Ok(ReadTerminalCommandOutputArgs {
+        command_id,
+        offset,
+        max_chars,
+        mode,
+    })
+}
+
+struct CommandOutputWindow {
+    output: String,
+    offset: usize,
+    returned_chars: usize,
+    truncated: bool,
+}
+
+fn command_output_window(
+    output: &str,
+    mode: &str,
+    offset: usize,
+    max_chars: usize,
+) -> CommandOutputWindow {
+    let chars = output.chars().collect::<Vec<_>>();
+    let total = chars.len();
+    let (start, end) = match mode {
+        "head" => (0, total.min(max_chars)),
+        "tail" => (total.saturating_sub(max_chars), total),
+        "full" => (0, total.min(max_chars)),
+        _ => {
+            let start = offset.min(total);
+            (start, (start + max_chars).min(total))
+        }
+    };
+    let text = chars[start..end].iter().collect::<String>();
+    CommandOutputWindow {
+        output: text,
+        offset: start,
+        returned_chars: end.saturating_sub(start),
+        truncated: start > 0 || end < total,
+    }
+}
+
+async fn find_terminal_command_record(
+    sessions: &SessionStore,
+    command_id: &str,
+) -> Option<TerminalCommandRecord> {
+    let command_record_lists = {
+        let guard = sessions.lock().await;
+        guard
+            .values()
+            .map(|session| session.command_records.clone())
+            .collect::<Vec<_>>()
+    };
+    for command_records in command_record_lists {
+        let records = command_records.lock().await;
+        if let Some(record) = records
+            .iter()
+            .find(|record| record.command_id == command_id)
+            .cloned()
+        {
+            return Some(record);
+        }
+    }
+    None
+}
+
+async fn execute_web_fetch_tool(call: &AgentToolCall) -> String {
+    match parse_web_fetch_args(&call.args_json) {
+        Ok(args) => match web_fetch(args).await {
+            Ok(result) => format!(
+                "Tool result for web_fetch\nstatus: completed\n{}",
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+            ),
+            Err(err) => format!("Tool result for web_fetch\nstatus: error\nerror: {err}"),
+        },
+        Err(err) => format!("Tool result for web_fetch\nstatus: error\nerror: {err}"),
+    }
+}
+
+struct WebFetchArgs {
+    url: String,
+    max_chars: usize,
+    timeout_secs: u64,
+}
+
+fn parse_web_fetch_args(args_json: &str) -> Result<WebFetchArgs, String> {
+    let value: Value =
+        serde_json::from_str(args_json).map_err(|e| format!("invalid web_fetch arguments: {e}"))?;
+    let url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "web_fetch requires url".to_string())?;
+    let max_chars = value
+        .get("maxChars")
+        .or_else(|| value.get("max_chars"))
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(WEB_FETCH_DEFAULT_MAX_CHARS)
+        .clamp(1_000, WEB_FETCH_MAX_CHARS);
+    let timeout_secs = value
+        .get("timeoutSecs")
+        .or_else(|| value.get("timeout_secs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(WEB_FETCH_DEFAULT_TIMEOUT_SECS)
+        .clamp(3, WEB_FETCH_MAX_TIMEOUT_SECS);
+    Ok(WebFetchArgs {
+        url,
+        max_chars,
+        timeout_secs,
+    })
+}
+
+async fn web_fetch(args: WebFetchArgs) -> Result<Value, String> {
+    let url = reqwest::Url::parse(&args.url).map_err(|e| format!("invalid URL: {e}"))?;
+    validate_public_web_url(&url).await?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .timeout(Duration::from_secs(args.timeout_secs))
+        .user_agent(format!("Shelly/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    validate_public_web_url(res.url()).await?;
+    let status = res.status().as_u16();
+    let final_url = res.url().to_string();
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !is_supported_web_content_type(&content_type) {
+        return Err(format!(
+            "unsupported content type: {}",
+            if content_type.is_empty() {
+                "unknown"
+            } else {
+                content_type.as_str()
+            }
+        ));
+    }
+    let (body, body_truncated) = read_limited_response_body(res, WEB_FETCH_MAX_BODY_BYTES).await?;
+    let raw_text = String::from_utf8_lossy(&body).to_string();
+    let is_html = content_type.to_ascii_lowercase().contains("html")
+        || raw_text.to_ascii_lowercase().contains("<html");
+    let title = if is_html {
+        extract_html_title(&raw_text)
+    } else {
+        None
+    };
+    let extractor = if is_html { "html_basic" } else { "raw_text" };
+    let extracted = if is_html {
+        html_to_markdownish_text(&raw_text)
+    } else {
+        raw_text.replace('\r', "")
+    };
+    let (text, text_truncated) = trim_text_to_chars(&extracted, args.max_chars);
+    let text_chars = text.chars().count();
+    Ok(json!({
+        "url": args.url,
+        "finalUrl": final_url,
+        "status": status,
+        "contentType": content_type,
+        "title": title,
+        "extractor": extractor,
+        "text": text,
+        "textChars": text_chars,
+        "truncated": body_truncated || text_truncated
+    }))
+}
+
+async fn read_limited_response_body(
+    res: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut stream = res.bytes_stream();
+    let mut body = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("failed reading response body: {e}"))?;
+        if body.len() + chunk.len() > max_bytes {
+            let remaining = max_bytes.saturating_sub(body.len());
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, truncated))
+}
+
+async fn validate_public_web_url(url: &reqwest::Url) -> Result<(), String> {
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err("web_fetch only supports http and https URLs".to_string()),
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL host is required".to_string())?;
+    let host_lower = host.to_ascii_lowercase();
+    if matches!(host_lower.as_str(), "localhost" | "localhost.localdomain")
+        || host_lower.ends_with(".localhost")
+    {
+        return Err("web_fetch blocks localhost URLs".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err("web_fetch blocks private, local, and special-use IP addresses".to_string());
+        }
+        return Ok(());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs = timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| "DNS lookup timed out".to_string())?
+    .map_err(|e| format!("DNS lookup failed: {e}"))?;
+    for addr in addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(
+                "web_fetch blocks hosts that resolve to private, local, or special-use IPs"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn is_supported_web_content_type(content_type: &str) -> bool {
+    if content_type.trim().is_empty() {
+        return true;
+    }
+    let lower = content_type.to_ascii_lowercase();
+    lower.starts_with("text/")
+        || lower.contains("json")
+        || lower.contains("xml")
+        || lower.contains("xhtml")
+        || lower.contains("markdown")
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let after_start = lower[start..].find('>')? + start + 1;
+    let end = lower[after_start..].find("</title>")? + after_start;
+    let title = decode_basic_html_entities(&strip_html_tags(&html[after_start..end]))
+        .trim()
+        .to_string();
+    (!title.is_empty()).then_some(title)
+}
+
+fn html_to_markdownish_text(html: &str) -> String {
+    let without_layout = remove_html_sections(
+        html,
+        &[
+            "script", "style", "noscript", "nav", "footer", "header", "aside", "svg", "form",
+            "button", "iframe",
+        ],
+    );
+    let with_breaks = add_html_text_breaks(&without_layout);
+    normalize_text_whitespace(&decode_basic_html_entities(&strip_html_tags(&with_breaks)))
+}
+
+fn remove_html_sections(html: &str, tags: &[&str]) -> String {
+    let mut text = html.to_string();
+    for tag in tags {
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(start) = lower.find(&format!("<{tag}")) else {
+                break;
+            };
+            let end_tag = format!("</{tag}>");
+            let end = lower[start..]
+                .find(&end_tag)
+                .map(|index| start + index + end_tag.len())
+                .or_else(|| lower[start..].find('>').map(|index| start + index + 1))
+                .unwrap_or(text.len());
+            text.replace_range(start..end, "\n");
+        }
+    }
+    text
+}
+
+fn add_html_text_breaks(html: &str) -> String {
+    let mut text = html.to_string();
+    let replacements = [
+        ("<br", "\n<br"),
+        ("</p>", "\n"),
+        ("</div>", "\n"),
+        ("</section>", "\n"),
+        ("</article>", "\n"),
+        ("</li>", "\n"),
+        ("</tr>", "\n"),
+        ("</h1>", "\n"),
+        ("</h2>", "\n"),
+        ("</h3>", "\n"),
+        ("</h4>", "\n"),
+        ("</h5>", "\n"),
+        ("</h6>", "\n"),
+    ];
+    for (needle, replacement) in replacements {
+        text = replace_ascii_case_insensitive(&text, needle, replacement);
+    }
+    text
+}
+
+fn replace_ascii_case_insensitive(text: &str, needle: &str, replacement: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = text;
+    let needle_lower = needle.to_ascii_lowercase();
+    loop {
+        let lower = remaining.to_ascii_lowercase();
+        let Some(index) = lower.find(&needle_lower) else {
+            out.push_str(remaining);
+            break;
+        };
+        out.push_str(&remaining[..index]);
+        out.push_str(replacement);
+        remaining = &remaining[index + needle.len()..];
+    }
+    out
+}
+
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_basic_html_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn normalize_text_whitespace(text: &str) -> String {
+    text.replace('\r', "")
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn trim_text_to_chars(text: &str, max_chars: usize) -> (String, bool) {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return (text.trim().to_string(), false);
+    }
+    (
+        text.chars().take(max_chars).collect::<String>().trim().to_string(),
+        true,
+    )
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -1346,7 +2190,7 @@ async fn stream_openai(
             "instructions": prompt.system,
             "input": openai_input_messages(prompt),
             "stream": true,
-            "tools": [exec_command_tool_schema_openai()],
+            "tools": agent_tool_schemas_openai(),
             "tool_choice": "auto",
             "temperature": provider.temperature,
             "max_output_tokens": provider.max_tokens
@@ -1381,7 +2225,7 @@ async fn stream_claude(
             "max_tokens": provider.max_tokens,
             "temperature": provider.temperature,
             "stream": true,
-            "tools": [exec_command_tool_schema_claude()],
+            "tools": agent_tool_schemas_claude(),
             "system": prompt.system,
             "messages": claude_messages(prompt)
         }))
@@ -1404,6 +2248,166 @@ fn endpoint(base_url: &str, path: &str) -> String {
     } else {
         format!("{base}/{path}")
     }
+}
+
+fn agent_tool_schemas_openai() -> Vec<Value> {
+    vec![
+        read_terminal_tail_tool_schema_openai(),
+        list_terminal_commands_tool_schema_openai(),
+        read_terminal_command_output_tool_schema_openai(),
+        web_fetch_tool_schema_openai(),
+        exec_command_tool_schema_openai(),
+    ]
+}
+
+fn agent_tool_schemas_claude() -> Vec<Value> {
+    vec![
+        read_terminal_tail_tool_schema_claude(),
+        list_terminal_commands_tool_schema_claude(),
+        read_terminal_command_output_tool_schema_claude(),
+        web_fetch_tool_schema_claude(),
+        exec_command_tool_schema_claude(),
+    ]
+}
+
+fn read_terminal_tail_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "read_terminal_tail",
+        "description": "Read the current SSH terminal tail. Use this first when you need recent terminal state, the latest command output, prompt, cwd, or visible errors. This is read-only and does not require approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." },
+                "lines": { "type": "integer", "description": "Number of recent terminal lines to read. Defaults to 80, capped at 500." },
+                "maxChars": { "type": "integer", "description": "Maximum returned characters. Defaults to 12000, capped at 50000." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn read_terminal_tail_tool_schema_claude() -> Value {
+    json!({
+        "name": "read_terminal_tail",
+        "description": "Read the current SSH terminal tail. Use this first when you need recent terminal state, the latest command output, prompt, cwd, or visible errors. This is read-only and does not require approval.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." },
+                "lines": { "type": "integer", "description": "Number of recent terminal lines to read. Defaults to 80, capped at 500." },
+                "maxChars": { "type": "integer", "description": "Maximum returned characters. Defaults to 12000, capped at 50000." }
+            }
+        }
+    })
+}
+
+fn list_terminal_commands_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "list_terminal_commands",
+        "description": "List recent command output records captured by Shelly Agent for the current SSH session. Current scope: only commands requested through exec_command and approved in Shelly Agent, plus completed interactive handoffs. It does not include arbitrary commands manually typed by the user in the SSH terminal. Use this after read_terminal_tail when the tail is insufficient, truncated, interleaved, or the user asks about a specific earlier Agent-run command. This returns an index with previews, not full output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." },
+                "limit": { "type": "integer", "description": "Maximum command records to return. Defaults to 20, capped at 50." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn list_terminal_commands_tool_schema_claude() -> Value {
+    json!({
+        "name": "list_terminal_commands",
+        "description": "List recent command output records captured by Shelly Agent for the current SSH session. Current scope: only commands requested through exec_command and approved in Shelly Agent, plus completed interactive handoffs. It does not include arbitrary commands manually typed by the user in the SSH terminal. Use this after read_terminal_tail when the tail is insufficient, truncated, interleaved, or the user asks about a specific earlier Agent-run command. This returns an index with previews, not full output.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sessionId": { "type": "string", "description": "Optional SSH session id. Omit to use the active session." },
+                "limit": { "type": "integer", "description": "Maximum command records to return. Defaults to 20, capped at 50." }
+            }
+        }
+    })
+}
+
+fn read_terminal_command_output_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "read_terminal_command_output",
+        "description": "Read captured output for one Shelly Agent command by commandId. Use this after list_terminal_commands identifies the relevant commandId, or when the commandId is already available from a previous tool result. Current scope: only Shelly Agent approved exec_command runs and completed interactive handoffs. It cannot read arbitrary manually typed shell history.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "commandId": { "type": "string", "description": "Command id from list_terminal_commands or a previous Shelly tool result." },
+                "offset": { "type": "integer", "description": "Character offset for window mode. Defaults to 0." },
+                "maxChars": { "type": "integer", "description": "Maximum returned characters. Defaults to 20000, capped at 80000." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["window", "head", "tail", "full"],
+                    "description": "Read mode. Defaults to window. Full is still capped by maxChars."
+                }
+            },
+            "required": ["commandId"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn read_terminal_command_output_tool_schema_claude() -> Value {
+    json!({
+        "name": "read_terminal_command_output",
+        "description": "Read captured output for one Shelly Agent command by commandId. Use this after list_terminal_commands identifies the relevant commandId, or when the commandId is already available from a previous tool result. Current scope: only Shelly Agent approved exec_command runs and completed interactive handoffs. It cannot read arbitrary manually typed shell history.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "commandId": { "type": "string", "description": "Command id from list_terminal_commands or a previous Shelly tool result." },
+                "offset": { "type": "integer", "description": "Character offset for window mode. Defaults to 0." },
+                "maxChars": { "type": "integer", "description": "Maximum returned characters. Defaults to 20000, capped at 80000." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["window", "head", "tail", "full"],
+                    "description": "Read mode. Defaults to window. Full is still capped by maxChars."
+                }
+            },
+            "required": ["commandId"]
+        }
+    })
+}
+
+fn web_fetch_tool_schema_openai() -> Value {
+    json!({
+        "type": "function",
+        "name": "web_fetch",
+        "description": "Fetch a public HTTP/HTTPS URL and return bounded cleaned text plus metadata. Use for public documentation, GitHub projects, Docker images, install guides, release notes, API docs, or errors likely answered by current external docs. Blocks localhost/private network targets and unsupported binary content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Public HTTP or HTTPS URL to fetch. Prefer official or user-provided URLs." },
+                "maxChars": { "type": "integer", "description": "Maximum returned text characters. Defaults to 20000, capped at 80000." },
+                "timeoutSecs": { "type": "integer", "description": "Request timeout in seconds. Defaults to 15, capped at 30." }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn web_fetch_tool_schema_claude() -> Value {
+    json!({
+        "name": "web_fetch",
+        "description": "Fetch a public HTTP/HTTPS URL and return bounded cleaned text plus metadata. Use for public documentation, GitHub projects, Docker images, install guides, release notes, API docs, or errors likely answered by current external docs. Blocks localhost/private network targets and unsupported binary content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Public HTTP or HTTPS URL to fetch. Prefer official or user-provided URLs." },
+                "maxChars": { "type": "integer", "description": "Maximum returned text characters. Defaults to 20000, capped at 80000." },
+                "timeoutSecs": { "type": "integer", "description": "Request timeout in seconds. Defaults to 15, capped at 30." }
+            },
+            "required": ["url"]
+        }
+    })
 }
 
 fn exec_command_tool_schema_openai() -> Value {

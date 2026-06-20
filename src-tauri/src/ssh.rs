@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use russh::{client, ChannelMsg};
-use russh_keys::{known_hosts, load_secret_key, parse_public_key_base64, ssh_key::PublicKey, HashAlg};
+use russh_keys::{
+    known_hosts, load_secret_key, parse_public_key_base64, ssh_key::PublicKey, HashAlg,
+};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -22,7 +24,20 @@ pub struct SessionHandle {
     pub input_tx: mpsc::Sender<Vec<u8>>,
     pub resize_tx: mpsc::Sender<(u32, u32)>,
     pub output: Arc<Mutex<String>>,
+    pub command_records: Arc<Mutex<Vec<TerminalCommandRecord>>>,
     pub handle: SshSharedHandle,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCommandRecord {
+    pub command_id: String,
+    pub command: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub output: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -235,9 +250,9 @@ pub async fn ssh_connect(
     let connect_timeout_secs = connect_timeout_secs
         .unwrap_or(SSH_CONNECT_TIMEOUT_SECS)
         .clamp(3, 120);
-    let keepalive_interval = keepalive_enabled.unwrap_or(true).then(|| {
-        Duration::from_secs(keepalive_interval_secs.unwrap_or(30).clamp(5, 300))
-    });
+    let keepalive_interval = keepalive_enabled
+        .unwrap_or(true)
+        .then(|| Duration::from_secs(keepalive_interval_secs.unwrap_or(30).clamp(5, 300)));
     let keepalive_max = keepalive_max_count.unwrap_or(3).clamp(1, 20) as usize;
     let unknown_host_key_policy = match unknown_host_key_policy.as_deref() {
         Some("reject") => "reject".to_string(),
@@ -318,6 +333,7 @@ pub async fn ssh_connect(
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(64);
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u32, u32)>(8);
     let output = Arc::new(Mutex::new(String::new()));
+    let command_records = Arc::new(Mutex::new(Vec::new()));
     let sessions_for_task = sessions.inner().clone();
 
     let sid = id.clone();
@@ -382,6 +398,7 @@ pub async fn ssh_connect(
             input_tx,
             resize_tx,
             output,
+            command_records,
             handle: ssh_handle,
         },
     );
@@ -548,7 +565,8 @@ fn remove_known_host_entries(host: &str, port: u16, path: &PathBuf) -> Result<us
         if !next.is_empty() {
             next.push('\n');
         }
-        std::fs::write(&path, next).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        std::fs::write(&path, next)
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     }
     Ok(removed)
 }
